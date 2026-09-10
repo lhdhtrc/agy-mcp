@@ -12,6 +12,8 @@ import sys
 STATE_DIR = os.environ.get("AGY_MCP_STATE_DIR") or os.path.join(
     os.path.expanduser("~"), ".agy-mcp"
 )
+# 元数据类调用（models / quota / version）的超时：这类调用要短，避免 status 卡死
+METADATA_TIMEOUT_SEC = 300
 SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
 # Antigravity CLI 自己的状态（会话 id、workspace 索引）放在这里
 AGY_CLI_HOME = os.environ.get("AGY_CLI_HOME") or os.path.join(

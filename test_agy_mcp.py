@@ -24,6 +24,7 @@ sys.path.insert(0, HERE)
 
 # 直接导入实现模块：测试会读写它的模块级变量（如 INSTANCE_ID），必须拿到同一个模块对象
 import core.impl as agy_mcp  # noqa: E402  (import after the state dir is set)
+import core.quota  # noqa: E402 —— 补丁打在拥有该状态的模块上
 import core.session  # noqa: E402 —— 补丁要打在拥有该状态的模块上
 
 # Antigravity CLI 的替身：既能说 print 模式（`-p ... --output-format json`），
@@ -617,23 +618,23 @@ def _quota_payload(gemini_percent: float, third_party_percent: float) -> dict:
 
 def test_effort_is_reconciled_with_the_model_id() -> None:
     """The CLI rejects `--model gemini-3.8-flash-high --effort low`, so keep them consistent."""
-    model, effort, notes = agy_mcp.reconcile_model_and_effort("gemini-3.8-flash-high", "low", False)
+    model, effort, notes = core.quota.reconcile_model_and_effort("gemini-3.8-flash-high", "low", False)
     assert (model, effort) == ("gemini-3.8-flash-low", "low"), (model, effort)
     assert any("gemini-3.8-flash-low" in note for note in notes), notes
 
     # 本来就一致：模型与强度都原样透传
-    assert agy_mcp.reconcile_model_and_effort("gemini-3.8-flash-low", "low", True)[:2] == (
+    assert core.quota.reconcile_model_and_effort("gemini-3.8-flash-low", "low", True)[:2] == (
         "gemini-3.8-flash-low",
         "low",
     )
 
     # 没有强度后缀的模型系列：保留模型、放弃 effort
-    model, effort, notes = agy_mcp.reconcile_model_and_effort("claude-sonnet-4-6", "low", True)
+    model, effort, notes = core.quota.reconcile_model_and_effort("claude-sonnet-4-6", "low", True)
     assert (model, effort) == ("claude-sonnet-4-6", None)
     assert any("ignored" in note for note in notes), notes
 
     # 完全没有模型：只传 effort 也可以
-    assert agy_mcp.reconcile_model_and_effort(None, "low", False) == (None, "low", [])
+    assert core.quota.reconcile_model_and_effort(None, "low", False) == (None, "low", [])
 
 
 def test_effort_change_is_sticky_for_the_session() -> None:
@@ -692,23 +693,23 @@ def test_stream_fixture_still_parses() -> None:
 
 
 def test_model_defaults_and_auto_selection() -> None:
-    assert agy_mcp.resolve_model(None) == (agy_mcp.DEFAULT_MODEL_ID, [])
-    assert agy_mcp.resolve_model("claude-sonnet-4-6") == ("claude-sonnet-4-6", [])
+    assert core.quota.resolve_model(None) == (agy_mcp.DEFAULT_MODEL_ID, [])
+    assert core.quota.resolve_model("claude-sonnet-4-6") == ("claude-sonnet-4-6", [])
 
     models = "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6"
-    original_models, original_quota = agy_mcp.cached_models, agy_mcp.read_quota
-    agy_mcp.cached_models = lambda: (0, models)
+    original_models, original_quota = core.quota.cached_models, core.quota.read_quota
+    core.quota.cached_models = lambda: (0, models)
     try:
         agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 5)})
-        chosen, notes = agy_mcp.resolve_model("auto")
+        chosen, notes = core.quota.resolve_model("auto")
         assert chosen == "gemini-3.8-flash-high", (chosen, notes)
         assert any("headroom 90%" in note for note in notes), notes
 
         agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(2, 80)})
-        chosen, notes = agy_mcp.resolve_model("auto")
+        chosen, notes = core.quota.resolve_model("auto")
         assert chosen == "claude-sonnet-4-6", (chosen, notes)
     finally:
-        agy_mcp.cached_models, agy_mcp.read_quota = original_models, original_quota
+        core.quota.cached_models, core.quota.read_quota = original_models, original_quota
         agy_mcp.QUOTA_CACHE.update({"ts": 0.0, "payload": None})
 
 
@@ -716,17 +717,17 @@ def test_quota_warning_is_warn_only_and_cooldown_limited() -> None:
     original = dict(agy_mcp.QUOTA_CACHE)
     try:
         agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 90)})
-        agy_mcp._QUOTA_WARNED_AT = 0.0
-        assert agy_mcp.quota_warning() is None
+        core.quota._QUOTA_WARNED_AT = 0.0
+        assert core.quota.quota_warning() is None
 
         agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(4, 90)})
-        warning = agy_mcp.quota_warning()
+        warning = core.quota.quota_warning()
         assert warning and "Gemini Models" in warning, warning
         # 冷却：同样的状态不能每次调用都唠叨一遍
-        assert agy_mcp.quota_warning() is None
+        assert core.quota.quota_warning() is None
     finally:
         agy_mcp.QUOTA_CACHE.update(original)
-        agy_mcp._QUOTA_WARNED_AT = 0.0
+        core.quota._QUOTA_WARNED_AT = 0.0
 
 
 def test_orphan_reaping_never_kills_unrelated_processes() -> None:
