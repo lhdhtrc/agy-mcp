@@ -42,6 +42,29 @@ agy_mcp/                     # 包（对外仍是同一个入口）
 
 ## 约束与验收
 
+## 两个必须先解决的硬约束（第一步的关键）
+
+**1. 同名遮蔽**：根目录同时存在 `agy_mcp.py` 与 `agy_mcp/` 包时，`import agy_mcp` 会命中**包**而不是那个文件
+（Python 的查找顺序是"包优先于同名模块"）。所以：
+
+- `agy_mcp.py` 只能以脚本身份运行（`python agy_mcp.py`，此时它是 `__main__`），
+  **它内部绝不能写 `import agy_mcp`** 来引用自己；
+- 脚本里引用包内容必须写全路径（`from agy_mcp.protocol import serve`），这是安全的；
+- 反过来，包内模块**不能**去 import 根目录那个 `agy_mcp.py`（会被自己遮蔽）。
+
+**2. 测试是按顶层名字调用的**：`test_agy_mcp.py` 里大量使用 `agy_mcp.resolve_model(...)`、
+`agy_mcp.QUOTA_CACHE`、`agy_mcp.session_flags(...)` 这类**顶层名**。一旦 `agy_mcp` 变成包，
+这些名字必须由 `agy_mcp/__init__.py` 显式再导出（`from .session import resolve_model, ...`），
+否则测试会成片失败。这不是"顺手"，而是第一步必须一起做完的事。
+
+因此第一步的正确形态是：
+
+1. 建 `agy_mcp/` 包，`__init__.py` **把当前根文件里的全部顶层名再导出一遍**（先照搬、后精简）；
+2. 把根 `agy_mcp.py` 改成薄脚本：只做 `from agy_mcp.server import main` + `sys.exit(main(sys.argv[1:]))`；
+3. 跑三方验收：`python -m py_compile` 全部文件、`python3 test_agy_mcp.py`（29/29）、
+   `python3 agy_mcp.py --status`（证明薄入口仍可用）；
+4. 这一步**不拆任何逻辑**，只搭骨架——先证明"包 + 薄入口"能共存，再谈后面七步。
+
 - **行为零变化**：只搬代码、改导入，不改逻辑。任何"顺手优化"另开提交。
 - **每步都要过**：`python3 -m py_compile`（所有文件）+ `python3 test_agy_mcp.py`（29/29）。
   测试文件保持原样，它本来就是按公开函数名调用的，正好当重构的安全网。
