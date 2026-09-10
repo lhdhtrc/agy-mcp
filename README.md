@@ -403,6 +403,8 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 | macOS 上找不到 `agy` | `which agy`，或 `export AGY_BIN=...`；脚本按 `AGY_BIN` → `PATH` → `~/.local/bin/agy` 顺序探测 |
 | 自己写脚本一次性喂完请求后没有回答 | 管道关闭时，仍在跑的轮次会在 `AGY_MCP_SHUTDOWN_GRACE_SEC`（默认 10s）后被取消；保持 stdin 打开直到收到响应 |
 | 回答后多一句 `quota is nearly used up` | 5 小时/周余量低于阈值，只是提示；换 `model: "auto"` 或降低用量 |
+| 回答是空的 / 提示 `finished without any text` | 那一轮把预算花在工具调用上了（浏览、读文件），或上下文过大。把数据直接给进去（`files` / `diff`）、缩小问题范围、加大 `timeout_sec`，或 `new_session: true` |
+| 让它查"实时行情 / 今天的新闻"却给了看似精确的数字 | **别信**。agy 的浏览器工具在这台机器上装不起来（Playwright driver 下载 404），它拿不到实时数据，只会凭记忆编。这类数据先让 Codex 抓，再把结果交给它分析 |
 
 ## 已知边界
 

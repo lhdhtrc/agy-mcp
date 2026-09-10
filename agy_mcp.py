@@ -1755,6 +1755,18 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
         return text_result(
             "Antigravity produced no answer because the sandbox denied the tool it needed.", True, notes
         )
+    if not answer and not out.strip():
+        # SUCCESS with no text: the turn ran but produced nothing, which almost always means
+        # it burned its budget on tool calls or hit the model's context limit.
+        spent = int(usage_tokens.get("input_tokens", 0) or 0)
+        hint = (
+            f"Antigravity finished without any text (status={status_value}, "
+            f"{payload.get('num_turns', '?')} turn(s), ~{spent} input tokens). "
+            "Usual causes: the turn spent itself on tool calls (browsing, file reads) or the "
+            "conversation is too large. Try a narrower prompt, pass the data in directly "
+            "(files/diff), raise timeout_sec, or start a new session."
+        )
+        return text_result(hint, True, notes)
     if requested_format == "json":
         return text_result(json.dumps(payload, ensure_ascii=False), False, notes)
     return text_result(answer if answer else out.strip(), False, notes)
