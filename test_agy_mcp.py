@@ -63,6 +63,7 @@ if "stream-json" in argv and "--input-format" in argv:
         turns += 1
         if content.startswith("slow:"):
             time.sleep(60)  # stands in for a long agent turn; a cancel must kill it
+        emit({"event": "step_update", "step_type": "text", "step_index": turns})
         emit({"event": "result", "result": {
             "conversation_id": conversation,
             "status": "SUCCESS",
@@ -89,8 +90,8 @@ def _fake_cli() -> str:
     return path
 
 
-def run_server(requests: list, extra_env: dict) -> dict:
-    """Drive the MCP server over stdio and return {request id: response}."""
+def run_server_messages(requests: list, extra_env: dict) -> list:
+    """Drive the MCP server over stdio and return every parsed message it sent."""
     env = {
         **os.environ,
         "AGY_MCP_STATE_DIR": STATE_DIR,
@@ -110,14 +111,21 @@ def run_server(requests: list, extra_env: dict) -> dict:
         env=env,
     )
     assert proc.returncode == 0, proc.stderr
-    responses = {}
+    messages = []
     for line in proc.stdout.splitlines():
         line = line.strip()
         if line.startswith("{"):
-            payload = json.loads(line)
-            if "id" in payload:
-                responses[payload["id"]] = payload
-    return responses
+            messages.append(json.loads(line))
+    return messages
+
+
+def run_server(requests: list, extra_env: dict) -> dict:
+    """Drive the MCP server and return {request id: response}."""
+    return {
+        message["id"]: message
+        for message in run_server_messages(requests, extra_env)
+        if "id" in message
+    }
 
 
 def ask(request_id: int, prompt: str, **args) -> dict:
@@ -364,6 +372,50 @@ def test_cancelled_turn_is_dropped_and_frees_the_session() -> None:
         assert proc.returncode == 0
 
 
+def test_progress_notifications_are_emitted() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-progress-") as state:
+        request = ask(1, "hello", session="progress-check")
+        request["params"]["_meta"] = {"progressToken": "tok-42"}
+        messages = run_server_messages(
+            [{"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}, request],
+            {"AGY_MCP_STATE_DIR": state},
+        )
+        updates = [
+            message
+            for message in messages
+            if message.get("method") == "notifications/progress"
+        ]
+        assert updates, "expected at least one progress notification"
+        assert all(u["params"]["progressToken"] == "tok-42" for u in updates)
+        assert any("queued" in str(u["params"]["message"]) for u in updates)
+        assert any(u["params"]["progress"] >= 1 for u in updates), updates
+
+
+def test_auto_handoff_compacts_a_long_conversation() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-auto-") as state:
+        responses = run_server(
+            [
+                ask(1, "remember VIOLET-7391", session="auto-check"),
+                call(2, "antigravity_sessions"),
+                ask(3, "status?", session="auto-check"),
+                call(4, "antigravity_sessions"),
+            ],
+            {
+                "AGY_MCP_STATE_DIR": state,
+                # The fake reports 10 input tokens for the first turn, so a 5-token
+                # ceiling makes the follow-up call compact automatically.
+                "AGY_MCP_AUTO_HANDOFF": "1",
+                "AGY_MCP_LONG_CONTEXT_TOKENS": "5",
+            },
+        )
+        before = tracked_conversation_ids(responses[2])
+        after = tracked_conversation_ids(responses[4])
+        assert before != after, f"auto-handoff must start a new conversation: {before} -> {after}"
+        answer = responses[3]["result"]["content"][0]["text"]
+        assert "echo: Summarize the conversation above" in answer, answer
+        assert any("auto-handoff" in note["text"] for note in responses[3]["result"]["content"][1:])
+
+
 TESTS = (
     test_extract_answer,
     test_seed_prompt,
@@ -376,6 +428,8 @@ TESTS = (
     test_oneshot_transport_still_answers,
     test_handoff_starts_a_new_conversation_with_the_digest,
     test_cancelled_turn_is_dropped_and_frees_the_session,
+    test_progress_notifications_are_emitted,
+    test_auto_handoff_compacts_a_long_conversation,
 )
 
 

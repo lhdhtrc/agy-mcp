@@ -143,7 +143,7 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 | `antigravity_sessions` | 查看 / 遗忘本服务器跟踪的会话，并列出 CLI 本地已有的会话 |
 | `antigravity_models` | 列出当前账号可用的模型（含可传给 `--model` 的 id） |
 | `antigravity_agents` | 列出可用 agent |
-| `antigravity_status` | 诊断：agy 路径、版本、工作目录、代理可见性、当日调用与 token、登录探测 |
+| `antigravity_status` | 诊断：agy 路径、版本、工作目录、代理可见性、当日调用与 token、耗时 p50/p95、登录探测 |
 
 ## 会话连续性
 
@@ -163,6 +163,9 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 **取消**：客户端中断一次调用（Codex 里按 Esc）会发 `notifications/cancelled`，服务器收到就立刻结束那一轮所对应的
 `agy` 会话进程，不再继续烧额度，也不再回一条没人要的响应；下次调用会自动接着同一会话继续。
 工具调用在服务器内保持先进先出，所以不会出现两轮抢同一个会话。
+
+**进度**：客户端请求里带 `progressToken` 时，服务器会把每一步（CLI 的 `step_update`）转成
+`notifications/progress` 发出去，长时间任务不会再看起来像卡死。
 
 ## 切换会话与 handoff
 
@@ -215,6 +218,7 @@ Claude and GPT models    Five Hour Limit Remaining     100%
 | `sandbox` | `true` | `--sandbox`，开启终端限制 |
 | `skip_permissions` | `false` | 自动批准 Antigravity 的工具调用（**谨慎**） |
 | `output_format` | `text` | `text`（返回解析后的回答）或 `json`（返回 CLI 原始 JSON） |
+| `json_schema` | 无 | 透传 `--json-schema`（内联 schema 或文件路径），让回答结构化 |
 | `timeout_sec` | `300` | 单次调用超时（另加 30 秒宽限） |
 | `extra_args` | 无 | 追加任意 `agy` 原始参数 |
 
@@ -262,6 +266,8 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `AGY_MCP_MODELS_CACHE_SEC` | `300` | `antigravity_status` 里模型列表的缓存时长 |
 | `AGY_MCP_HANDOFF_PROMPT` | 内置提示词 | 覆盖 handoff 摘要提示词（内置版要求"用与原对话相同的语言"输出） |
 | `AGY_MCP_SHUTDOWN_GRACE_SEC` | `10` | 客户端关闭连接后，等待在跑的工具调用收尾的秒数（超时则中止） |
+| `AGY_MCP_AUTO_HANDOFF` | `0` | 设 `1` 时，上下文超过阈值的那次调用会**自动**压缩并换新会话 |
+| `AGY_MCP_USAGE_ROTATE_MB` | `5` | 用量日志超过该大小就丢掉较旧的一半（`0` = 不轮转） |
 | `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
 | `AGY_CLI_HOME` | `~/.gemini/antigravity-cli` | CLI 自身状态目录（一般不用改） |
 
@@ -274,6 +280,26 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `~/.agy-mcp/usage.jsonl` | 每次调用一行（不含 prompt 正文） |
 | `~/.agy-mcp/call.lock` | 跨进程单飞锁 |
 | `~/.gemini/antigravity-cli/` | `agy` 自身状态：会话库、缓存与日志 |
+
+## 多账号 / 多实例
+
+想同时挂两个 Antigravity 账号（或个人 + 团队），给每个账号注册一个独立条目即可——
+服务器状态、会话与用量都按 `AGY_MCP_STATE_DIR` 隔离，CLI 凭据按 `AGY_CLI_HOME` 隔离：
+
+```toml
+[mcp_servers.antigravity-work]
+type = "stdio"
+command = "python3"
+args = ["/Users/you/agy-mcp/agy_mcp.py"]
+
+[mcp_servers.antigravity-work.env]
+AGY_CLI_HOME = "/Users/you/.gemini/antigravity-cli-work"
+AGY_MCP_STATE_DIR = "/Users/you/.agy-mcp-work"
+HTTP_PROXY = "http://127.0.0.1:7890"
+HTTPS_PROXY = "http://127.0.0.1:7890"
+```
+
+如果两个账号需要不同的 CLI 二进制或包装脚本，再用 `AGY_MCP_AGY_CMD` 指过去即可。
 
 ## 排障
 
@@ -301,11 +327,12 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 11 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 13 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
-覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**。
+覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**、
+进度通知、自动 handoff。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

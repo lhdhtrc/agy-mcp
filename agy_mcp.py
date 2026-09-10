@@ -41,6 +41,7 @@ LOCK_PATH = os.path.join(STATE_DIR, "call.lock")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
 SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
+_USAGE_SINCE_ROTATE = 0
 # Antigravity CLI keeps its own state (conversation ids, workspace index) here.
 AGY_CLI_HOME = os.environ.get("AGY_CLI_HOME") or os.path.join(
     os.path.expanduser("~"), ".gemini", "antigravity-cli"
@@ -60,6 +61,7 @@ INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
 DEFAULT_ADOPT_WINDOW_SEC = 120.0
 DEFAULT_LONG_CONTEXT_TOKENS = 100000
 DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
+DEFAULT_USAGE_ROTATE_MB = 5.0
 HANDOFF_PROMPT = (
     "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
     "Requirements:\n"
@@ -179,12 +181,60 @@ def calls_today(state: Dict[str, Any]) -> int:
 
 
 def log_usage(entry: Dict[str, Any]) -> None:
+    global _USAGE_SINCE_ROTATE
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(USAGE_PATH, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as exc:
         log(f"could not append usage log: {exc}")
+        return
+    _USAGE_SINCE_ROTATE += 1
+    if _USAGE_SINCE_ROTATE >= 25:
+        _USAGE_SINCE_ROTATE = 0
+        rotate_usage_log()
+
+
+def rotate_usage_log() -> None:
+    """Keep the usage log from growing without bound: drop the older half past the limit."""
+    try:
+        if not USAGE_ROTATE_BYTES or os.path.getsize(USAGE_PATH) < USAGE_ROTATE_BYTES:
+            return
+        with open(USAGE_PATH, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        keep = lines[len(lines) // 2 :]
+        with open(USAGE_PATH, "w", encoding="utf-8") as handle:
+            handle.writelines(keep)
+        log(f"rotated usage log: kept {len(keep)} of {len(lines)} lines")
+    except OSError as exc:
+        log(f"could not rotate usage log: {exc}")
+
+
+def usage_stats(limit: int = 200) -> Dict[str, Any]:
+    """p50/p95 turn duration over the most recent usage entries."""
+    try:
+        with open(USAGE_PATH, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()[-limit:]
+    except OSError:
+        return {}
+    durations = []
+    for line in lines:
+        try:
+            value = json.loads(line).get("duration_ms")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if isinstance(value, (int, float)):
+            durations.append(float(value))
+    if not durations:
+        return {}
+    durations.sort()
+    pick = lambda q: durations[min(len(durations) - 1, int(q * len(durations)))]  # noqa: E731
+    return {
+        "samples": len(durations),
+        "p50_ms": int(pick(0.5)),
+        "p95_ms": int(pick(0.95)),
+        "max_ms": int(durations[-1]),
+    }
 
 
 def _read_store() -> Dict[str, Any]:
@@ -551,16 +601,26 @@ class Worker:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def send(self, prompt: str, timeout: float) -> Dict[str, Any]:
+    def send(
+        self,
+        prompt: str,
+        timeout: float,
+        on_progress: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         if not self.alive() or self.proc is None or self.proc.stdin is None:
             raise RuntimeError("agy stream process is not running")
         self.busy = True
         try:
-            return self._send_locked(prompt, timeout)
+            return self._send_locked(prompt, timeout, on_progress)
         finally:
             self.busy = False
 
-    def _send_locked(self, prompt: str, timeout: float) -> Dict[str, Any]:
+    def _send_locked(
+        self,
+        prompt: str,
+        timeout: float,
+        on_progress: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         assert self.proc is not None and self.proc.stdin is not None
 
         while not self.events.empty():  # drop anything left over from a previous turn
@@ -574,6 +634,7 @@ class Worker:
         self.proc.stdin.flush()
 
         deadline = time.monotonic() + timeout
+        steps = 0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -608,6 +669,15 @@ class Worker:
                     self.last_used = time.time()
                     self.turns += 1
                     return result
+            elif on_progress is not None and event.get("event") != "init":
+                steps += 1
+                label = str(
+                    event.get("step_type") or event.get("type") or event.get("event") or "step"
+                )
+                try:
+                    on_progress(steps, label)
+                except Exception as exc:  # noqa: BLE001 - progress must never break a turn
+                    log(f"progress callback failed: {exc!r}")
 
     def stop(self) -> None:
         proc = self.proc
@@ -631,6 +701,8 @@ WORKER_IDLE_SEC = _env_float("AGY_MCP_WORKER_IDLE_SEC", DEFAULT_WORKER_IDLE_SEC)
 ADOPT_WINDOW_SEC = _env_float("AGY_MCP_INSTANCE_WINDOW_SEC", DEFAULT_ADOPT_WINDOW_SEC)
 LONG_CONTEXT_TOKENS = _env_int("AGY_MCP_LONG_CONTEXT_TOKENS", DEFAULT_LONG_CONTEXT_TOKENS)
 SHUTDOWN_GRACE_SEC = _env_float("AGY_MCP_SHUTDOWN_GRACE_SEC", DEFAULT_SHUTDOWN_GRACE_SEC)
+AUTO_HANDOFF = _env_int("AGY_MCP_AUTO_HANDOFF", 0) != 0
+USAGE_ROTATE_BYTES = int(_env_float("AGY_MCP_USAGE_ROTATE_MB", DEFAULT_USAGE_ROTATE_MB) * 1024 * 1024)
 
 
 def reap_workers() -> None:
@@ -679,8 +751,9 @@ def _install_signal_handlers() -> None:
 class ActiveTask:
     """A tool call running off the main loop, so cancellations can reach it."""
 
-    def __init__(self, request_id: Any) -> None:
+    def __init__(self, request_id: Any, progress_token: Any = None) -> None:
         self.request_id = request_id
+        self.progress_token = progress_token
         self.cancelled = threading.Event()
         self.suppress_response = False
         self.worker: Optional["Worker"] = None
@@ -731,12 +804,33 @@ def cancel_task(request_id: Any) -> bool:
     return True
 
 
+def notify_progress(progress: float, message: str, task: Optional[ActiveTask] = None) -> None:
+    """Tell the client how a long turn is going (only if it asked for progress)."""
+    task = task or current_task()
+    if task is None or task.progress_token is None:
+        return
+    with SEND_LOCK:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": task.progress_token,
+                    "progress": round(float(progress), 3),
+                    "message": message,
+                },
+            }
+        )
+
+
 atexit.register(shutdown_workers)
 
 
 def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_recent: bool) -> List[str]:
     """Flags that must hold for the life of a session process."""
     flags: List[str] = []
+    if args.get("json_schema"):
+        flags += ["--json-schema", str(args["json_schema"])]
     if args.get("model"):
         flags += ["--model", str(args["model"])]
     if args.get("effort"):
@@ -829,6 +923,13 @@ ASK_SCHEMA: Dict[str, Any] = {
             "enum": ["text", "json"],
             "default": "text",
             "description": "CLI print-mode output format returned verbatim.",
+        },
+        "json_schema": {
+            "type": "string",
+            "description": (
+                "Optional JSON schema (inline string or path) passed to the CLI with --json-schema, "
+                "so the Antigravity answer is structured. Implies a per-schema session process."
+            ),
         },
         "disable_slash_commands": {
             "type": "boolean",
@@ -948,6 +1049,15 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 f"started a new Antigravity conversation in {workspace}"
             )
 
+    if not handoff and AUTO_HANDOFF and conversation and LONG_CONTEXT_TOKENS > 0:
+        previous_input = int(entry.get("last_input_tokens", 0) or 0)
+        if previous_input >= LONG_CONTEXT_TOKENS:
+            handoff = True
+            notes.append(
+                f"auto-handoff: the previous turn resent about {previous_input} input tokens; "
+                "compacting into a fresh conversation (AGY_MCP_AUTO_HANDOFF=1)"
+            )
+
     flags = session_flags(args, conversation, continue_recent)
     requested_format = str(args.get("output_format") or "text")
     transport = str(os.environ.get("AGY_MCP_TRANSPORT") or "stream").strip().lower()
@@ -970,6 +1080,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     code = 0
     worker: Optional[Worker] = None
 
+    notify_progress(0, "queued for Antigravity")
     try:
         with FileLock(LOCK_PATH, LOCK_WAIT_SEC):
             state = read_state()
@@ -1014,7 +1125,11 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                         )
                         worker.start()
                         WORKERS[key] = worker
-                    digest_payload = worker.send(handoff_prompt(), timeout_sec + TIMEOUT_GRACE_SEC)
+                    digest_payload = worker.send(
+                        handoff_prompt(),
+                        timeout_sec + TIMEOUT_GRACE_SEC,
+                        on_progress=lambda step, label: notify_progress(step, f"handoff digest: {label}"),
+                    )
                     digest = extract_answer(digest_payload) or ""
                     merge_usage(usage_tokens, digest_payload)
                     worker.stop()
@@ -1048,7 +1163,11 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     task.bind(worker)
                 if is_cancelled():
                     return text_result("Antigravity turn cancelled.", True)
-                payload = worker.send(seed_prompt(prompt, digest), timeout_sec + TIMEOUT_GRACE_SEC)
+                payload = worker.send(
+                    seed_prompt(prompt, digest),
+                    timeout_sec + TIMEOUT_GRACE_SEC,
+                    on_progress=lambda step, label: notify_progress(step, f"step {step}: {label}"),
+                )
             else:
                 digest = None
                 if handoff and conversation:
@@ -1332,6 +1451,7 @@ def tool_status(args: Dict[str, Any]) -> Dict[str, Any]:
             "output": int(state.get("output_tokens", 0) or 0) if state.get("day") == _today() else 0,
         },
         "usage_log": USAGE_PATH,
+        "durations": usage_stats(),
     }
     report["proxy"] = proxy_env_report() or "(no proxy env visible to this server)"
     report["agy_cli_home"] = AGY_CLI_HOME
@@ -1569,7 +1689,9 @@ def serve() -> int:
         # Tool calls can block for minutes; run them off the loop so a
         # `notifications/cancelled` arriving meanwhile can stop the turn.
         if message.get("method") == "tools/call" and message.get("id") is not None:
-            task = ActiveTask(message["id"])
+            params = message.get("params") or {}
+            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+            task = ActiveTask(message["id"], meta.get("progressToken"))
             register_task(task)
             TOOL_QUEUE.put((message, task))
             continue
