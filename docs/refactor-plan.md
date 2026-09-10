@@ -5,12 +5,15 @@
 
 ## 目标结构
 
+采用 `core/` 包 + `main.py` 入口的布局（包名不再与入口文件名冲突）：
+
 ```
-agy_mcp/                     # 包（对外仍是同一个入口）
-├── __init__.py              # 导出 serve/main，保持 `python -m agy_mcp` 可用
-├── __main__.py              # 等价于现在的 `if __name__ == "__main__"`
+main.py                      # 正式入口：薄脚本，只做参数转发与 sys.exit(main(...))
+agy_mcp.py                   # 兼容壳：同样的薄脚本，保证既有客户端配置不用改
+core/                        # 全部实现
+├── __init__.py              # 显式再导出全部顶层名（测试与兼容壳都依赖它）
 ├── config.py                # 环境变量、路径、超时/阈值等常量（唯一读环境的地方）
-├── agy.py                   # CLI 定位与调用：resolve_agy / agy_command_prefix / run_agy / _git
+├── agy.py                   # CLI 定位与调用：resolve_agy / agy_command_prefix / run_agy / _git / pid_alive
 ├── worker.py                # Worker 类、WORKERS 注册表、回收线程、信号处理、孤儿清理
 ├── session.py               # 会话表（按实例隔离）、token 累计、进程 pid 记录
 ├── quota.py                 # 额度读取与解析、后台刷新、配额告警、模型 auto 选型
@@ -21,9 +24,12 @@ agy_mcp/                     # 包（对外仍是同一个入口）
 └── server.py                # 组装入口：main()、--self-test、--status、--list-tools
 ```
 
-根目录保留 `agy_mcp.py`、`register_agy_mcp.py`、`test_agy_mcp.py`、`docs/`、`.github/`。
-`agy_mcp.py` 退化为**薄入口**（`from agy_mcp.server import main`），这样既有的客户端配置
-（`command = python3 .../agy_mcp.py`）完全不用改。
+根目录保留 `register_agy_mcp.py`、`test_agy_mcp.py`、`docs/`、`.github/`。
+
+**两个入口都保留**：`main.py` 是正式入口，`agy_mcp.py` 是兼容壳——既有客户端配置里写的是
+`python3 .../agy_mcp.py`，它必须继续可用。两者内容一致，都只做转发生效。
+
+好处：包名 `core` 与入口文件名不再冲突（原来的 `agy_mcp/` + `agy_mcp.py` 会触发"包优先于同名模块"的遮蔽问题）。
 
 ## 迁移顺序（每步单独提交，每步都必须 29/29 通过）
 
@@ -44,18 +50,19 @@ agy_mcp/                     # 包（对外仍是同一个入口）
 
 ## 两个必须先解决的硬约束（第一步的关键）
 
-**1. 同名遮蔽**：根目录同时存在 `agy_mcp.py` 与 `agy_mcp/` 包时，`import agy_mcp` 会命中**包**而不是那个文件
-（Python 的查找顺序是"包优先于同名模块"）。所以：
+**1. 测试是按顶层名字调用的**：`test_agy_mcp.py` 里有 **24 个** `agy_mcp.xxx` 顶层引用
+（`resolve_model`、`QUOTA_CACHE`、`session_flags`、`extract_answer`、`read_sessions`、
+`_read_worker_pids`、`_write_worker_pids`、`_is_agy_process`、`_QUOTA_WARNED_AT`、`INSTANCE_ID`、
+`SESSIONS_PATH`、`DEFAULT_MODEL_ID`、`read_quota`、`cached_models`、`quota_warning`、
+`reconcile_model_and_effort`、`reap_orphan_workers`、`resolve_agy`、`merge_usage`、
+`parse_stream_line`、`progress_from_event`、`seed_prompt`、`write_sessions`、`py`）。
 
-- `agy_mcp.py` 只能以脚本身份运行（`python agy_mcp.py`，此时它是 `__main__`），
-  **它内部绝不能写 `import agy_mcp`** 来引用自己；
-- 脚本里引用包内容必须写全路径（`from agy_mcp.protocol import serve`），这是安全的；
-- 反过来，包内模块**不能**去 import 根目录那个 `agy_mcp.py`（会被自己遮蔽）。
+拆分后 `core/__init__.py` **必须显式再导出**这些名字（以及后续新增的），否则测试会成片红。
+这是第一步必须一起做完的事，不是"顺手"。
 
-**2. 测试是按顶层名字调用的**：`test_agy_mcp.py` 里大量使用 `agy_mcp.resolve_model(...)`、
-`agy_mcp.QUOTA_CACHE`、`agy_mcp.session_flags(...)` 这类**顶层名**。一旦 `agy_mcp` 变成包，
-这些名字必须由 `agy_mcp/__init__.py` 显式再导出（`from .session import resolve_model, ...`），
-否则测试会成片失败。这不是"顺手"，而是第一步必须一起做完的事。
+**2. 入口脚本不要自引用**：`main.py` 与 `agy_mcp.py` 都是脚本，只能写
+`from core.server import main`——绝不能写 `import agy_mcp` 去引用自己（历史上那个同名遮蔽问题
+已经用 `core` 包名绕开，但这条习惯仍要遵守，以免以后再撞上）。
 
 因此第一步的正确形态是：
 
