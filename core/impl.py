@@ -47,19 +47,23 @@ TIMEOUT_GRACE_SEC = 30
 # 元数据类调用（models / quota / version）仍需短超时，否则 status 之类可能一直挂着。
 METADATA_TIMEOUT_SEC = 300
 UNLIMITED_PRINT_TIMEOUT = "24h"
+# 路径与通用工具已抽到 core/config.py（唯一读环境变量的地方）
+from core.config import (  # noqa: E402
+    AGY_CLI_HOME,
+    SESSIONS_PATH,
+    STATE_DIR,
+    _env_float,
+    _env_int,
+    log,
+)
 
 # 护栏：CLI 是官方客户端，但额度本是给人驱动 agent 用的。串行化调用、限制每日总量，
 # 是为了让流量形状保持"正常"——这也是包装层在账号风险上唯一能做的事。
-STATE_DIR = os.environ.get("AGY_MCP_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".agy-mcp")
 LOCK_PATH = os.path.join(STATE_DIR, "call.lock")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
-SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
 _USAGE_SINCE_ROTATE = 0
 # Antigravity CLI 自己的状态（会话 id、workspace 索引）放在这里。
-AGY_CLI_HOME = os.environ.get("AGY_CLI_HOME") or os.path.join(
-    os.path.expanduser("~"), ".gemini", "antigravity-cli"
-)
 LOCK_WAIT_SEC = 600
 DEFAULT_MIN_INTERVAL_SEC = 5.0
 DEFAULT_MAX_CALLS_PER_DAY = 200
@@ -102,18 +106,6 @@ def handoff_prompt() -> str:
     return os.environ.get("AGY_MCP_HANDOFF_PROMPT") or HANDOFF_PROMPT
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
 
 
 MIN_INTERVAL_SEC = _env_float("AGY_MCP_MIN_INTERVAL_SEC", DEFAULT_MIN_INTERVAL_SEC)
@@ -522,11 +514,6 @@ def proxy_env_report() -> Dict[str, Any]:
         if value:
             report[key] = mask_proxy(value) if "PROXY" in key.upper() and "NO_PROXY" not in key.upper() else value
     return report
-
-
-def log(message: str) -> None:
-    sys.stderr.write(f"[agy-mcp] {message}\n")
-    sys.stderr.flush()
 
 
 def text_result(text: str, is_error: bool = False, notes: Optional[List[str]] = None) -> Dict[str, Any]:
