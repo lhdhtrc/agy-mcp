@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 agy-mcp contributors
-"""Register the agy-mcp server into cc-switch (SSOT DB) and the Codex live config.
+"""Register the agy-mcp server into a Codex config (and cc-switch, when present).
 
-cc-switch keeps MCP servers in ~/.cc-switch/cc-switch.db and re-projects the
-enabled ones into each client's live file, so a hand-written entry in
-~/.codex/config.toml alone is not durable. This script writes both places:
+Two places are written, both idempotently:
 
-  1. upsert the row in the cc-switch DB (mcp_servers, enabled_codex = 1)
-  2. upsert the [mcp_servers.antigravity] block in ~/.codex/config.toml
+  1. the [mcp_servers.antigravity] block in ~/.codex/config.toml (backed up and
+     TOML-validated before writing);
+  2. if this machine uses cc-switch, the same server in its DB
+     (~/.cc-switch/cc-switch.db, mcp_servers table, enabled_codex = 1).
+
+Step 2 matters because cc-switch treats its database as the source of truth and
+re-projects the enabled servers into each client's live file, which would
+otherwise overwrite a hand-written entry in config.toml. It is skipped when no
+cc-switch database exists.
 
 Usage:
   python register_agy_mcp.py                 # register (idempotent)
