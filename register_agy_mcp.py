@@ -66,7 +66,7 @@ def build_block(python_exe: str, script_path: str, env: dict) -> str:
         f"command = {toml_literal(python_exe)}",
         f"args = [{toml_literal(script_path)}]",
         "startup_timeout_sec = 30",
-        "tool_timeout_sec = 900",
+        "tool_timeout_sec = 86400",
     ]
     if env:
         lines.append("")
@@ -110,7 +110,7 @@ def server_config(python_exe: str, script_path: str, env: dict) -> dict:
         "command": python_exe,
         "args": [script_path],
         "startup_timeout_sec": 30,
-        "tool_timeout_sec": 900,
+        "tool_timeout_sec": 86400,
     }
     if env:
         spec["env"] = dict(env)
