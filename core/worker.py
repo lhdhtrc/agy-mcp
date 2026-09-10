@@ -17,14 +17,23 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from core import session
-from core.agy import CREATE_NO_WINDOW, agy_command_prefix, kill_process_tree, resolve_agy
-from core.session import _write_worker_pids, track_worker_pid  # Worker 生命周期要用
+from core.agy import CREATE_NO_WINDOW, agy_command_prefix, kill_process_tree
+from core.session import track_worker_pid  # Worker 生命周期要用
 from core.jobs import running_job_count  # 已抽出，正常导入
 from core.config import (
     WORKER_IDLE_SEC,
     log,
 )
-from core.protocol import parse_stream_line, progress_from_event, summarize_delta  # noqa: F401
+from core.protocol import parse_stream_line, progress_from_event
+
+
+def _option_value(argv: List[str], flag: str) -> Optional[str]:
+    """取 `--flag value` 里的值（没这个开关就返回 None）。"""
+    if flag in argv:
+        index = argv.index(flag) + 1
+        if index < len(argv):
+            return str(argv[index])
+    return None
 
 class Worker:
     """一个常驻的 `agy --input-format stream-json` 进程，绑定在一个会话上。"""
@@ -43,6 +52,10 @@ class Worker:
         self.retire = False
         self.step_count = 0
         self.last_step_input = 0
+        # 起这个进程时用的"会话位置"：用来判断它能不能直接承接这一轮
+        # （预热的空进程没有 --conversation，用它续接就会把历史丢掉）
+        self.started_conversation = _option_value(argv, "--conversation")
+        self.started_continue_recent = "-c" in argv
 
     def start(self) -> None:
         command = agy_command_prefix()
@@ -191,30 +204,54 @@ class Worker:
 
 
 WORKERS: Dict[str, Worker] = {}
+# WORKERS 会被主循环、工具线程、预热线程与回收线程同时碰，字典操作要互斥
+WORKERS_LOCK = threading.Lock()
+
+
+def start_registered_worker(key: str, argv: List[str], workspace: str) -> Tuple[Worker, bool]:
+    """起一个会话进程并登记；同名进程已经在跑时丢掉新起的那个。
+
+    返回（实际使用的 worker, 是否由本函数新起）。预热线程与第一次真实调用会抢同一个 key，
+    不这样做就会出现两个进程、而且注册表只认后写的那个，先起的直接失联（既不回收也不停）。
+    """
+    worker = Worker(key, argv, workspace)
+    worker.start()
+    with WORKERS_LOCK:
+        existing = WORKERS.get(key)
+        if existing is not None and existing.alive():
+            worker.stop()
+            return existing, False
+        WORKERS[key] = worker
+    return worker, True
 
 
 def reap_workers() -> None:
     now = time.time()
-    for key in list(WORKERS):
-        worker = WORKERS[key]
-        if worker.busy:
-            continue  # a long turn must not be reaped from under itself
-        if worker.retire:
-            # 因为会话切换了模型/强度而退休的进程：只在轮次之间停掉。
-            worker.stop()
-            WORKERS.pop(key, None)
-            continue
-        idle = WORKER_IDLE_SEC > 0 and now - worker.last_used > WORKER_IDLE_SEC
-        if not worker.alive() or idle:
-            worker.stop()
-            WORKERS.pop(key, None)
+    doomed: List[Worker] = []
+    with WORKERS_LOCK:
+        for key in list(WORKERS):
+            worker = WORKERS[key]
+            if worker.busy:
+                continue  # a long turn must not be reaped from under itself
+            if worker.retire:
+                # 因为会话切换了模型/强度而退休的进程：只在轮次之间停掉。
+                doomed.append(WORKERS.pop(key))
+                continue
+            idle = WORKER_IDLE_SEC > 0 and now - worker.last_used > WORKER_IDLE_SEC
+            if not worker.alive() or idle:
+                doomed.append(WORKERS.pop(key))
+    for worker in doomed:
+        worker.stop()
 
 
 def shutdown_workers() -> None:
-    for worker in list(WORKERS.values()):
+    with WORKERS_LOCK:
+        doomed = list(WORKERS.values())
+        WORKERS.clear()
+    for worker in doomed:
         worker.stop()
-    WORKERS.clear()
-    _write_worker_pids([])
+    # 只注销本实例自己的记录：别的 Codex 线程的会话进程还在跑
+    session.clear_worker_pids()
 
 
 
@@ -222,31 +259,48 @@ def shutdown_workers() -> None:
 
 
 def reap_orphan_workers() -> None:
-    """被 SIGKILL / 任务管理器强杀的服务器来不及清理自己的会话进程，这里替它收拾。"""
+    """被 SIGKILL / 任务管理器强杀的服务器来不及清理自己的会话进程，这里替它收拾。
+
+    **只清理服务器进程已经不在的实例**：workers.json 是所有 MCP 实例共用的，
+    另一个 Codex 线程的服务器仍然活着时，它的会话进程是"在用"而不是"孤儿"，
+    杀掉它会让那一轮当场失败。
+    """
     # 只要可能还有长作业在跑就不要清理：否则会把它的进程一起杀掉。
     pending = running_job_count()
     if pending:
         log(f"skipping orphan cleanup: {pending} job(s) still marked running")
         return
-    pids = session._read_worker_pids()
-    if not pids:
+    records = session._read_worker_records()
+    if not records:
         return
-    for pid in pids:
-        if not session._is_agy_process(pid):
+    live = session.live_instance_ids()
+    for instance_id, record in records.items():
+        if instance_id in live:
             continue
-        try:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=CREATE_NO_WINDOW, timeout=15,
-                )
-            else:
-                os.kill(pid, signal.SIGTERM)
-            log(f"reaped orphaned session process {pid}")
-        except (OSError, subprocess.SubprocessError):
-            pass
-    _write_worker_pids([])
+        for pid in record.get("pids") or []:
+            if not session._is_agy_process(pid):
+                continue
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=CREATE_NO_WINDOW, timeout=15,
+                    )
+                else:
+                    os.kill(pid, signal.SIGTERM)
+                log(f"reaped orphaned session process {pid}")
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def drop_dead_instances(current: Dict[str, Any]) -> None:
+        # 在锁里重新判一次活跃度：清理期间刚启动的实例不能被误删记录
+        live_now = session.live_instance_ids()
+        for instance_id in list(current):
+            if instance_id not in live_now:
+                current.pop(instance_id, None)
+
+    session._mutate_worker_records(drop_dead_instances)
 
 
 def _reaper_loop(interval: float = 60.0) -> None:

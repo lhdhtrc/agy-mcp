@@ -19,7 +19,6 @@ import time
 from typing import Any, Dict, Optional
 
 from core.config import (
-    MAX_CALLS_PER_DAY,
     MAX_PARALLEL,
     STATE_DIR,
     USAGE_ROTATE_BYTES,
@@ -29,6 +28,7 @@ from core.config import (
 
 # 只有一份 state.json：跨进程串行化用的锁与状态文件都放在这里
 LOCK_PATH = os.path.join(STATE_DIR, "call.lock")
+STATE_LOCK_PATH = os.path.join(STATE_DIR, "state.lock")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
 # 每写够这么多条明细就检查一次是否该轮转，避免每次都去 stat 文件
@@ -88,6 +88,17 @@ class FileLock:
 
 def _today() -> str:
     return time.strftime("%Y-%m-%d")
+
+
+@contextlib.contextmanager
+def state_guard() -> Any:
+    """state.json 的读-改-写也要串行。
+
+    默认单飞模式下 turn_guard 已经覆盖到了，但 `AGY_MCP_MAX_PARALLEL > 1` 时锁降到
+    会话粒度，两个会话同时收尾就会互相覆盖当日计数与 token 累计。
+    """
+    with FileLock(STATE_LOCK_PATH, LOCK_WAIT_SEC):
+        yield
 
 
 def read_state() -> Dict[str, Any]:

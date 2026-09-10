@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = tempfile.mkdtemp(prefix="agy-mcp-test-")
@@ -173,6 +175,81 @@ def latest_session_entry(state_dir: str) -> dict:
     instances = [data for data in store["instances"].values() if data.get("sessions")]
     newest = max(instances, key=lambda data: float(data.get("last_seen") or 0))
     return next(iter(newest["sessions"].values()))
+
+
+def _dead_pid() -> int:
+    """一个确定已经不存在的 pid（用来伪造"服务器被强杀"留下的记录）。"""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def _write_worker_record(instance: str, worker_pid: int, server_pid) -> None:
+    """直接写一条 workers.json 记录：某个实例的会话进程 pid + 它自己的服务器进程 pid。"""
+    core.session._write_worker_records(
+        {instance: {"pid": server_pid, "pids": [worker_pid], "last_seen": time.time()}}
+    )
+
+
+def _server_env(extra: dict) -> dict:
+    return {
+        **os.environ,
+        "AGY_MCP_STATE_DIR": STATE_DIR,
+        "AGY_MCP_MIN_INTERVAL_SEC": "0",
+        "AGY_MCP_AGY_CMD": f'"{sys.executable}" "{_fake_cli()}"',
+        **extra,
+    }
+
+
+def start_live_server(extra_env: dict = None) -> tuple:
+    """起一个**保持 stdin 打开**的服务器（模拟一个还在用的 MCP 实例）。"""
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "agy_mcp.py")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=HERE,
+        env=_server_env(extra_env or {}),
+    )
+    lines: "queue.Queue[str]" = queue.Queue()
+
+    def pump() -> None:
+        for line in proc.stdout:
+            lines.put(line)
+
+    threading.Thread(target=pump, daemon=True).start()
+    return proc, lines
+
+
+def live_call(proc, lines, request_id: int, tool: str, **args) -> dict:
+    """向一个活着的服务器发一条请求并等它的响应（超时即失败，不挂测试）。"""
+    proc.stdin.write(json.dumps(call(request_id, tool, **args)) + "\n")
+    proc.stdin.flush()
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            line = lines.get(timeout=1.0)
+        except queue.Empty:
+            if proc.poll() is not None:
+                raise AssertionError("the MCP server exited early")
+            continue
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        message = json.loads(line)
+        if message.get("id") == request_id:
+            return message
+    raise AssertionError(f"no response for request {request_id}")
+
+
+def _stop(proc) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.kill()
+    proc.wait(timeout=30)
 
 
 def test_extract_answer() -> None:
@@ -516,7 +593,8 @@ def test_orphaned_workers_are_reaped() -> None:
     """被强杀的服务器会留下会话进程；下次启动要把它们清掉。"""
     sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
     try:
-        agy_mcp._write_worker_pids([sleeper.pid])
+        # 记录归属的服务器进程已经不在了 —— 这才是"孤儿"
+        _write_worker_record("server-that-died", sleeper.pid, _dead_pid())
         original = core.session._is_agy_process
         core.session._is_agy_process = lambda pid: True  # 守卫逻辑另有用例覆盖
         try:
@@ -529,12 +607,34 @@ def test_orphaned_workers_are_reaped() -> None:
     finally:
         if sleeper.poll() is None:
             sleeper.kill()
+            sleeper.wait()
+
+
+def test_a_live_instance_keeps_its_workers() -> None:
+    """另一个还活着的 MCP 实例（= 另一条 Codex 线程）的会话进程不是孤儿，不能动。"""
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
+    try:
+        # 服务器进程就是本测试进程：还活着
+        _write_worker_record("another-live-thread", sleeper.pid, os.getpid())
+        original = core.session._is_agy_process
+        core.session._is_agy_process = lambda pid: True
+        try:
+            agy_mcp.reap_orphan_workers()
+        finally:
+            core.session._is_agy_process = original
+        time.sleep(0.5)
+        assert sleeper.poll() is None, "a live instance's session process must not be reaped"
+        assert sleeper.pid in agy_mcp._read_worker_pids(), "its pid record must survive too"
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+            sleeper.wait()
 
 
 def test_orphan_reaping_never_kills_unrelated_processes() -> None:
     sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
     try:
-        agy_mcp._write_worker_pids([sleeper.pid])
+        _write_worker_record("server-that-died", sleeper.pid, _dead_pid())
         agy_mcp.reap_orphan_workers()  # real guard: this pid is not the Antigravity CLI
         time.sleep(0.5)
         assert sleeper.poll() is None, "must not kill a process that is not agy"
@@ -542,6 +642,42 @@ def test_orphan_reaping_never_kills_unrelated_processes() -> None:
         if sleeper.poll() is None:
             sleeper.kill()
             sleeper.wait()
+
+
+def test_a_second_thread_does_not_break_the_first_one() -> None:
+    """第二个 Codex 线程（= 第二个 MCP 实例）启动时，不能把第一个线程的热会话进程当孤儿杀掉。
+
+    这是最实际的并行场景：workers.json 是所有实例共用的，谁都不该动"服务器还活着"的租。
+    """
+    first, first_lines = start_live_server()
+    second = None
+    third = None
+    try:
+        live_call(first, first_lines, 1, "antigravity_ask", prompt="a")
+        second, second_lines = start_live_server()  # 启动时就会跑一次孤儿回收
+        live_call(second, second_lines, 1, "antigravity_ask", prompt="b")
+
+        # 第一个线程的常驻进程如果被杀，这一轮就会重新冷启动（假 CLI 里轮次从 1 重新数）
+        text = live_call(
+            first, first_lines, 2, "antigravity_ask", prompt="c", output_format="json"
+        )["result"]["content"][0]["text"]
+        assert json.loads(text)["num_turns"] == 2, "the first thread lost its warm session process"
+
+        owners = {record.get("pid") for record in core.session._read_worker_records().values()}
+        assert {first.pid, second.pid} <= owners, f"both live instances should be tracked: {owners}"
+
+        # 第一个实例被强杀（来不及清理自己）后，下一个实例启动时只该清掉它的记录
+        _stop(first)
+        third, third_lines = start_live_server()
+        # 等它真正跑完启动时的孤儿回收（服务器是先回收再读 stdin 的）
+        live_call(third, third_lines, 1, "antigravity_ask", prompt="d")
+        owners = {record.get("pid") for record in core.session._read_worker_records().values()}
+        assert first.pid not in owners, "the killed instance's record should be reaped"
+        assert second.pid in owners, "the live instance's record must be left alone"
+    finally:
+        _stop(first)
+        _stop(second)
+        _stop(third)
 
 
 def _make_repo_with_change() -> str:
@@ -730,17 +866,142 @@ def test_quota_warning_is_warn_only_and_cooldown_limited() -> None:
         core.quota._QUOTA_WARNED_AT = 0.0
 
 
-def test_orphan_reaping_never_kills_unrelated_processes() -> None:
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
+def test_new_session_starts_a_fresh_conversation() -> None:
+    """`new_session` 必须真的换会话，而不是把常驻进程里的旧上下文接着用。"""
+    messages = run_server_messages(
+        [ask(1, "first"), ask(2, "second", new_session=True, output_format="json")],
+        {"AGY_MCP_TRANSPORT": "stream"},
+    )
+    text = next(message["result"]["content"][0]["text"] for message in messages if message.get("id") == 2)
+    payload = json.loads(text)
+    # 假 CLI 每个进程自己数轮次：1 说明换了一个会话进程，2 说明续接了旧会话
+    assert payload["num_turns"] == 1, f"new_session must start over, got {payload['num_turns']} turn(s)"
+
+
+def test_prewarm_reuses_the_first_session_process() -> None:
+    """预热过的进程要直接被第一次调用复用，而不是被当成"参数变了的旧进程"停掉。"""
+    env = {
+        **os.environ,
+        "AGY_MCP_STATE_DIR": STATE_DIR,
+        "AGY_MCP_MIN_INTERVAL_SEC": "0",
+        "AGY_MCP_PREWARM": "1",
+        "AGY_MCP_AGY_CMD": f'"{sys.executable}" "{_fake_cli()}"',
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "agy_mcp.py")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=HERE,
+        env=env,
+    )
     try:
-        agy_mcp._write_worker_pids([sleeper.pid])
-        agy_mcp.reap_orphan_workers()  # real guard: this pid is not the Antigravity CLI
-        time.sleep(0.5)
-        assert sleeper.poll() is None, "must not kill a process that is not agy"
+        time.sleep(2.0)  # 等预热把进程登记好（预热只是 Popen，远快于此）
+        out, err = proc.communicate(json.dumps(ask(1, "hi")) + "\n", timeout=90)
     finally:
-        if sleeper.poll() is None:
-            sleeper.kill()
-            sleeper.wait()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert "prewarmed the default session process" in err, err
+    assert "started a long-lived Antigravity session process" not in out, out
+
+
+def test_prewarmed_process_is_not_used_to_resume_a_conversation() -> None:
+    """预热的空进程没有 `--conversation`，拿它续接会静默丢掉历史；引擎必须认出这一点。"""
+    args = core.tools.default_session_args()
+    flags = core.tools.session_flags(args, None, False)
+    worker = core.worker.Worker(
+        core.tools.worker_key("default", "ws", args),
+        ["--input-format", "stream-json", "--output-format", "stream-json"] + flags,
+        "ws",
+    )
+    assert core.tools.worker_matches_intent(worker, None, False) is True  # 全新会话：能用
+    assert core.tools.worker_matches_intent(worker, "conv-1", False) is False  # 续接：不能用
+    assert core.tools.worker_matches_intent(worker, None, True) is False  # continue_session：也不能用
+    # 聊过几轮的进程无法回到全新会话（new_session 的语义）
+    worker.turns = 3
+    worker.conversation_id = "conv-9"
+    assert core.tools.worker_matches_intent(worker, None, False) is False
+    assert core.tools.worker_matches_intent(worker, "conv-9", False) is True
+
+
+def test_interrupted_turn_keeps_sticky_settings() -> None:
+    """中途失败（超时 / 进程被杀）不能把会话粘住的 model、effort 与 token 累计抹掉。"""
+    entry = {
+        "conversation_id": "conv-sticky",
+        "workspace": os.path.join(STATE_DIR, "sticky-ws"),
+        "calls": 3,
+        "num_turns": 5,
+        "model": "gemini-3.8-flash-low",
+        "effort": "low",
+        "input_tokens": 120,
+        "output_tokens": 12,
+    }
+    sessions = {"default": dict(entry)}
+    worker = types.SimpleNamespace(conversation_id="conv-sticky", turns=6)
+    core.session.remember_partial_turn(sessions, entry, "default", entry["workspace"], worker)
+    merged = sessions["default"]
+    assert merged["num_turns"] == 6 and "interrupted" in merged["last_error"]
+    assert merged["model"] == "gemini-3.8-flash-low", "sticky model must survive an interrupted turn"
+    assert merged["effort"] == "low", "sticky effort must survive an interrupted turn"
+    assert (merged["input_tokens"], merged["output_tokens"]) == (120, 12)
+
+
+def test_finished_jobs_do_not_block_orphan_cleanup() -> None:
+    """进程早就没了的陈旧作业记录，不能把孤儿清理一直挡住。"""
+    job_id = "job-stale-1"
+    core.jobs.write_job(
+        job_id,
+        {
+            "job_id": job_id,
+            "state": "running",
+            "pid": _dead_pid(),
+            "out": core.jobs._job_output_path(job_id),
+        },
+    )
+    try:
+        assert core.jobs.running_job_count() == 0, "a dead job must not count as running"
+    finally:
+        core.jobs._remove_quietly(core.jobs._job_path(job_id))
+
+
+def test_register_script_can_add_a_second_entry() -> None:
+    """多账号要能注册第二条条目：`--id` 只影响自己那条，不碰别人的。"""
+    import register_agy_mcp as reg
+
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-register-") as tmp:
+        path = os.path.join(tmp, "config.toml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("[mcp_servers.other]\ncommand = 'x'\n")
+
+        block_b = reg.build_block("/py", "/tools/agy-mcp/agy_mcp.py", {"A": "1"}, server_id="antigravity-b")
+        assert "[mcp_servers.antigravity-b]" in block_b
+        assert reg.write_codex_config(path, block_b, False, False, "antigravity-b") == "updated"
+
+        block_a = reg.build_block("/py", "/tools/agy-mcp/agy_mcp.py", {}, server_id="antigravity")
+        reg.write_codex_config(path, block_a, False, False, "antigravity")
+
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        assert "[mcp_servers.antigravity]" in text
+        assert "[mcp_servers.antigravity-b]" in text, "第二条条目不能被第一条覆盖"
+        assert "[mcp_servers.other]" in text
+        assert reg.read_existing_env(path, "antigravity-b") == {"A": "1"}
+
+        # 移除第一条时，第二条要留下
+        reg.write_codex_config(path, "", True, False, "antigravity")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        assert "[mcp_servers.antigravity]" not in text
+        assert "[mcp_servers.antigravity-b]" in text
+
+        # 共享 Codex 工具时不要把我们自己的条目（任意 id）共享出去，否则递归
+        entries = reg.codex_tool_entries(path, "antigravity-b")
+        assert "antigravity-b" not in entries and "antigravity" not in entries
+        assert "other" in entries
 
 
 def test_read_only_tools_do_not_queue_behind_a_turn() -> None:
@@ -803,6 +1064,9 @@ TESTS = (
     test_models_are_returned_structured,
     test_sessions_record_token_totals,
     test_orphaned_workers_are_reaped,
+    test_a_live_instance_keeps_its_workers,
+    test_orphan_reaping_never_kills_unrelated_processes,
+    test_a_second_thread_does_not_break_the_first_one,
     test_diff_is_captured_locally_and_attached,
     test_diff_on_a_non_repo_is_reported_not_fatal,
     test_model_defaults_and_auto_selection,
@@ -810,7 +1074,12 @@ TESTS = (
     test_effort_is_reconciled_with_the_model_id,
     test_effort_change_is_sticky_for_the_session,
     test_quota_warning_is_warn_only_and_cooldown_limited,
-    test_orphan_reaping_never_kills_unrelated_processes,
+    test_new_session_starts_a_fresh_conversation,
+    test_prewarm_reuses_the_first_session_process,
+    test_prewarmed_process_is_not_used_to_resume_a_conversation,
+    test_interrupted_turn_keeps_sticky_settings,
+    test_finished_jobs_do_not_block_orphan_cleanup,
+    test_register_script_can_add_a_second_entry,
     test_read_only_tools_do_not_queue_behind_a_turn,
 )
 

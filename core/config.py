@@ -22,7 +22,7 @@ AGY_CLI_HOME = os.environ.get("AGY_CLI_HOME") or os.path.join(
 
 # MCP 服务器标识与协议版本（版本号发版时改这里）
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.2.1"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 # 0 表示不限时：真实的 agent 作业可能跑很久，而 CLI 自带的 print 超时默认只有 5 分钟，

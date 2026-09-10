@@ -42,7 +42,14 @@ from core.tasks import (
     send,
     _TASK_LOCAL,
 )
-from core.tools import HANDLERS, TOOLS, session_flags, tool_status
+from core.tools import (
+    HANDLERS,
+    TOOLS,
+    default_session_args,
+    session_flags,
+    tool_status,
+    worker_key,
+)
 from core.worker import (
     WORKERS,
     Worker,
@@ -50,6 +57,7 @@ from core.worker import (
     _reaper_loop,
     reap_orphan_workers,
     shutdown_workers,
+    start_registered_worker,
 )
 
 
@@ -68,23 +76,25 @@ FAST_TOOLS = frozenset(
 
 
 def prewarm_default_session() -> None:
-    """提前把默认会话进程拉起来，让第一次真正的调用就是热轮。"""
+    """提前把默认会话进程拉起来，让第一次真正的调用就是热轮。
+
+    启动参数必须与"什么都不指定的一次调用"完全一致（`default_session_args`），
+    否则 worker key 对不上：预热起的进程会被当成切换参数后的旧进程直接停掉，白冷启动一次。
+    """
     try:
         workspace = os.path.abspath(os.getcwd())
-        base_flags = session_flags(
-            {"sandbox": True, "skip_permissions": True, "disable_slash_commands": True}, None, False
-        )
-        key = f"{DEFAULT_SESSION}|{workspace}|{' '.join(base_flags)}"
-        if key in WORKERS:
+        args = default_session_args()
+        key = worker_key(DEFAULT_SESSION, workspace, args, False)
+        if WORKERS.get(key) is not None:
             return
-        worker = Worker(
+        worker, created = start_registered_worker(
             key,
-            ["--input-format", "stream-json", "--output-format", "stream-json"] + base_flags,
+            ["--input-format", "stream-json", "--output-format", "stream-json"]
+            + session_flags(args, None, False),
             workspace,
         )
-        worker.start()
-        WORKERS[key] = worker
-        log(f"prewarmed the default session process for {workspace}")
+        if created:
+            log(f"prewarmed the default session process for {workspace}")
     except Exception as exc:  # noqa: BLE001 - prewarming is best effort
         log(f"prewarm failed: {exc!r}")
 
@@ -187,10 +197,11 @@ def serve() -> int:
     log(f"serving {SERVER_NAME} {SERVER_VERSION}")
     _install_signal_handlers()
     reap_orphan_workers()
+    if PREWARM:
+        # 同步登记：与第一次调用抢同一个 key 时不会留下两个进程（预热本身只是 Popen，很快）
+        prewarm_default_session()
     threading.Thread(target=_reaper_loop, daemon=True).start()
     threading.Thread(target=_tool_call_loop, daemon=True).start()
-    if PREWARM:
-        threading.Thread(target=prewarm_default_session, daemon=True).start()
     while True:
         raw = sys.stdin.buffer.readline()
         if not raw:

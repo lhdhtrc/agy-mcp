@@ -27,6 +27,18 @@ def _job_path(job_id: str) -> str:
     return os.path.join(JOBS_DIR, f"{job_id}.json")
 
 
+def _job_output_path(job_id: str) -> str:
+    """脱离进程的原始输出；清作业时要连它一起删，否则目录只涨不消。"""
+    return os.path.join(JOBS_DIR, f"{job_id}.out")
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def write_job(job_id: str, payload: Dict[str, Any]) -> None:
     """作业落盘：客户端重启也不会丢掉一个长作业的线索。"""
     try:
@@ -62,7 +74,16 @@ def list_jobs() -> List[Dict[str, Any]]:
 
 
 def running_job_count() -> int:
-    return sum(1 for job in list_jobs() if job.get("state") == "running")
+    """真的还在跑的作业数。
+
+    只看 `state == "running"` 会被"进程早就没了、但没人去 collect 的"陈旧记录骗到，
+    而孤儿清理又是靠它来决定动不动手的——一条僵尸记录就能让清理永远不执行。
+    """
+    return sum(
+        1
+        for job in list_jobs()
+        if job.get("state") == "running" and pid_alive(int(job.get("pid") or 0))
+    )
 
 
 DETACHED_PROCESS = 0x00000008

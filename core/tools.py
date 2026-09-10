@@ -38,6 +38,7 @@ from core.guard import (
     log_usage,
     merge_usage,
     read_state,
+    state_guard,
     turn_guard,
     usage_stats,
     write_state,
@@ -49,6 +50,8 @@ from core.jobs import (
     JOBS_DIR,
     JOBS_LOCK,
     _job_path,
+    _job_output_path,
+    _remove_quietly,
     collect_detached_job,
     list_jobs,
     read_job,
@@ -87,7 +90,7 @@ from core.session import (
     write_sessions,
 )
 from core.tasks import current_task, is_cancelled, notify_progress
-from core.worker import WORKERS, Worker, reap_workers
+from core.worker import WORKERS, WORKERS_LOCK, Worker, reap_workers, start_registered_worker
 
 
 def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_recent: bool) -> List[str]:
@@ -117,6 +120,47 @@ def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_re
     if isinstance(extra, list):
         flags += [str(item) for item in extra]
     return flags
+
+
+def worker_key(
+    session_name: str, workspace: str, args: Dict[str, Any], continue_recent: bool = False
+) -> str:
+    """常驻会话进程的复用 key：会话名 + workspace + 影响进程启动的参数。
+
+    预热与真实调用必须走同一个函数，否则两边的 key 对不上（预热白做）。
+    会话 id 不能进 key：否则第一次追问就会再冷启动一个进程。
+    """
+    return f"{session_name}|{workspace}|{' '.join(session_flags(args, None, continue_recent))}"
+
+
+def default_session_args() -> Dict[str, Any]:
+    """一次"什么都不指定"的调用实际使用的 model / effort。
+
+    不传 model 时也不是"没有模型"，而是解析成默认模型并写进启动参数，
+    所以预热必须带上同样的参数，否则 key 永远对不上。
+    """
+    model, _ = resolve_model(None)
+    model, effort, _ = reconcile_model_and_effort(model, None, False)
+    return {"model": model or "", "effort": effort or ""}
+
+
+def worker_matches_intent(
+    worker: Worker, conversation: Optional[str], continue_recent: bool
+) -> bool:
+    """现有常驻进程能不能直接承接这一轮。
+
+    两个坑：预热的空进程没有 `--conversation`（拿它续接会静默丢掉历史）；已经聊过
+    几轮的进程无法回到全新会话（`new_session` 会失效）。所以要看它"停在哪"。
+    """
+    if worker.turns == 0:
+        return worker.started_conversation == (conversation or None) and (
+            worker.started_continue_recent == bool(continue_recent)
+        )
+    if conversation:
+        return worker.conversation_id == conversation
+    if continue_recent:
+        return True
+    return False  # 想要一个全新会话，但它已经有历史
 
 
 ASK_SCHEMA: Dict[str, Any] = {
@@ -442,7 +486,9 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     requested_format = str(args.get("output_format") or "text")
     transport = str(os.environ.get("AGY_MCP_TRANSPORT") or "stream").strip().lower()
 
-    timeout_sec = args.get("timeout_sec") or DEFAULT_TIMEOUT_SEC
+    timeout_sec = args.get("timeout_sec")
+    if timeout_sec is None:  # 显式传 0 表示"不限时"，不能被默认值顶掉
+        timeout_sec = DEFAULT_TIMEOUT_SEC
     try:
         timeout_sec = float(timeout_sec)
     except (TypeError, ValueError):
@@ -466,15 +512,16 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     notify_progress(0, "queued for Antigravity", force=True)
     try:
         with turn_guard(session_name, workspace):
-            state = read_state()
-            used = calls_today(state)
-            if MAX_CALLS_PER_DAY and used >= MAX_CALLS_PER_DAY:
-                return text_result(
-                    f"Daily Antigravity cap reached ({used}/{MAX_CALLS_PER_DAY}). "
-                    "Raise AGY_MCP_MAX_CALLS_PER_DAY (0 disables the cap) if this volume is intended.",
-                    True,
-                )
-            last = state.get("last_call_ts")
+            with state_guard():
+                state = read_state()
+                used = calls_today(state)
+                if MAX_CALLS_PER_DAY and used >= MAX_CALLS_PER_DAY:
+                    return text_result(
+                        f"Daily Antigravity cap reached ({used}/{MAX_CALLS_PER_DAY}). "
+                        "Raise AGY_MCP_MAX_CALLS_PER_DAY (0 disables the cap) if this volume is intended.",
+                        True,
+                    )
+                last = state.get("last_call_ts")
             if MIN_INTERVAL_SEC > 0 and isinstance(last, (int, float)):
                 gap = MIN_INTERVAL_SEC - (time.time() - last)
                 if gap > 0:
@@ -487,36 +534,60 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
             if transport == "stream":
                 # 会话由常驻进程持有，所以会话 id 不能进 key：否则第一次追问就会再冷启动一个进程。
                 base_flags = session_flags(args, None, continue_recent)
-                key = f"{session_name}|{workspace}|{' '.join(base_flags)}"
-                for stale in [k for k in WORKERS if k.startswith(f"{session_name}|{workspace}|") and k != key]:
+                key = worker_key(session_name, workspace, args, continue_recent)
+                prefix = f"{session_name}|{workspace}|"
+                busy_keys: List[str] = []
+                retired: List[Worker] = []
+                with WORKERS_LOCK:
+                    for stale in [k for k in WORKERS if k.startswith(prefix) and k != key]:
+                        stale_worker = WORKERS[stale]
+                        if stale_worker.busy:
+                            busy_keys.append(stale)
+                        else:
+                            retired.append(WORKERS.pop(stale))
+                if busy_keys:
                     # 切换模型/强度绝不能打断正在跑的工作：把旧进程标记为退休，
                     # 等它到下一个轮次边界再停。
-                    stale_worker = WORKERS[stale]
-                    if stale_worker.busy:
-                        stale_worker.retire = True
-                        notes.append(
-                            "model/effort change takes effect from the next turn; "
-                            "the running Antigravity turn is left to finish"
-                        )
+                    notes.append(
+                        "model/effort change takes effect from the next turn; "
+                        "the running Antigravity turn is left to finish"
+                    )
+                    with WORKERS_LOCK:
+                        for stale in busy_keys:
+                            if stale in WORKERS:
+                                WORKERS[stale].retire = True
+                for stale_worker in retired:
+                    stale_worker.stop()
+
+                with WORKERS_LOCK:
+                    worker = WORKERS.get(key)
+                    if worker is not None and (
+                        not worker.alive() or not worker_matches_intent(worker, conversation, continue_recent)
+                    ):
+                        # 活着的进程，但它停在别的会话上（预热的空进程 / 已经聊过几轮却要
+                        # new_session / 想切到另一个 conversation）：不能直接拿它接着跑。
+                        WORKERS.pop(key, None)
+                        stale_worker = worker
+                        worker = None
                     else:
-                        WORKERS.pop(stale).stop()
-                worker = WORKERS.get(key)
-                if worker is not None and not worker.alive():
-                    worker.stop()
-                    WORKERS.pop(key, None)
-                    worker = None
+                        stale_worker = None
+                if stale_worker is not None:
+                    stale_worker.stop()
 
                 stream_args = ["--input-format", "stream-json", "--output-format", "stream-json"]
                 digest: Optional[str] = None
                 if handoff and (worker is not None or conversation):
                     if worker is None:
-                        worker = Worker(
+                        worker, created = start_registered_worker(
                             key,
                             stream_args + session_flags(args, conversation, False),
                             workspace,
                         )
-                        worker.start()
-                        WORKERS[key] = worker
+                        if created:
+                            notes.append(
+                                "started a long-lived Antigravity session process; later calls reuse it "
+                                "(set AGY_MCP_TRANSPORT=oneshot to force one process per call)"
+                            )
                     digest_payload = worker.send(
                         handoff_prompt(),
                         call_timeout,
@@ -527,7 +598,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     digest = extract_answer(digest_payload) or ""
                     merge_usage(usage_tokens, digest_payload)
                     worker.stop()
-                    WORKERS.pop(key, None)
+                    with WORKERS_LOCK:
+                        WORKERS.pop(key, None)
                     worker = None
                     conversation = None  # the real turn must land in a brand-new conversation
                     if digest:
@@ -541,17 +613,16 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                         if handoff
                         else base_flags
                     )
-                    worker = Worker(
+                    worker, created = start_registered_worker(
                         key,
                         stream_args + start_flags,
                         workspace,
                     )
-                    worker.start()
-                    WORKERS[key] = worker
-                    notes.append(
-                        "started a long-lived Antigravity session process; later calls reuse it "
-                        "(set AGY_MCP_TRANSPORT=oneshot to force one process per call)"
-                    )
+                    if created:
+                        notes.append(
+                            "started a long-lived Antigravity session process; later calls reuse it "
+                            "(set AGY_MCP_TRANSPORT=oneshot to force one process per call)"
+                        )
                 task = current_task()
                 if task is not None:
                     task.bind(worker)
@@ -665,20 +736,23 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 write_sessions(sessions)
 
-            same_day = state.get("day") == _today()
-            write_state(
-                {
-                    "day": _today(),
-                    "calls": used + (1 if succeeded else 0),
-                    "last_call_ts": time.time(),
-                    "total_tokens": (int(state.get("total_tokens", 0) or 0) if same_day else 0)
-                    + int(usage_tokens.get("total_tokens", 0) or 0),
-                    "input_tokens": (int(state.get("input_tokens", 0) or 0) if same_day else 0)
-                    + int(usage_tokens.get("input_tokens", 0) or 0),
-                    "output_tokens": (int(state.get("output_tokens", 0) or 0) if same_day else 0)
-                    + int(usage_tokens.get("output_tokens", 0) or 0),
-                }
-            )
+            with state_guard():
+                # 重新读一次：`AGY_MCP_MAX_PARALLEL > 1` 时别的会话可能刚写过计数
+                state = read_state()
+                same_day = state.get("day") == _today()
+                write_state(
+                    {
+                        "day": _today(),
+                        "calls": calls_today(state) + (1 if succeeded else 0),
+                        "last_call_ts": time.time(),
+                        "total_tokens": (int(state.get("total_tokens", 0) or 0) if same_day else 0)
+                        + int(usage_tokens.get("total_tokens", 0) or 0),
+                        "input_tokens": (int(state.get("input_tokens", 0) or 0) if same_day else 0)
+                        + int(usage_tokens.get("input_tokens", 0) or 0),
+                        "output_tokens": (int(state.get("output_tokens", 0) or 0) if same_day else 0)
+                        + int(usage_tokens.get("output_tokens", 0) or 0),
+                    }
+                )
             log_usage(
                 {
                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1005,16 +1079,15 @@ def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
     write_job(job_id, record)
     with JOBS_LOCK:
         JOBS[job_id] = record
-    return text_result(
-        json.dumps(
-            {
-                "job_id": job_id,
-                "state": "running",
-                "hint": "poll with antigravity_job; the job keeps running while you do other work",
-            },
-            ensure_ascii=False,
-        )
-    )
+    state = str(record.get("state") or "running")
+    summary: Dict[str, Any] = {"job_id": job_id, "state": state}
+    if state == "running":
+        summary["hint"] = "poll with antigravity_job; the job keeps running while you do other work"
+        return text_result(json.dumps(summary, ensure_ascii=False))
+    # 起进程就失败的情况：别让调用方去轮询一个永远不会产出结果的作业
+    blocks = (record.get("result") or {}).get("content") or []
+    summary["error"] = blocks[0].get("text") if blocks else "could not start the job"
+    return text_result(json.dumps(summary, ensure_ascii=False), True)
 
 
 def tool_job(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1033,11 +1106,12 @@ def tool_job(args: Dict[str, Any]) -> Dict[str, Any]:
                 JOBS.clear()
         try:
             if job_id:
-                os.remove(_job_path(job_id))
+                for path in (_job_path(job_id), _job_output_path(job_id)):
+                    _remove_quietly(path)
             else:
                 for name in os.listdir(JOBS_DIR):
-                    if name.endswith(".json"):
-                        os.remove(os.path.join(JOBS_DIR, name))
+                    if name.endswith(".json") or name.endswith(".out") or name.endswith(".tmp"):
+                        _remove_quietly(os.path.join(JOBS_DIR, name))
         except OSError:
             pass
         return text_result("jobs cleared")

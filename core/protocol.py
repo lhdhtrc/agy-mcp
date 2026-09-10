@@ -9,8 +9,6 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.config import log  # noqa: F401
-
 
 def text_result(
     text: str, is_error: bool = False, notes: Optional[List[str]] = None
