@@ -86,8 +86,8 @@ from core.config import (
     _env_int,
     log,
 )
-# 协议层纯函数（先搬 text_result，其余逐个搬）
-from core.protocol import text_result  # noqa: E402,F401
+# 协议层纯函数（已搬 text_result / join_streams，其余逐个搬）
+from core.protocol import join_streams, text_result  # noqa: E402,F401
 # 额度解析、后台刷新、配额告警与 model=auto 选型已抽到 core/quota.py
 from core import quota as quota  # noqa: E402
 from core.quota import *  # noqa: E402,F401,F403 —— 名字多且会被测试补丁，集中导入
@@ -397,18 +397,6 @@ def proxy_env_report() -> Dict[str, Any]:
     return report
 
 
-
-
-def join_streams(code: int, out: str, err: str) -> str:
-    body = out.strip()
-    err = err.strip()
-    if not body and err:
-        body = err
-    elif err:
-        body = f"{body}\n\n[stderr]\n{err}"
-    if code != 0 and not body:
-        body = f"agy exited with code {code}"
-    return body
 
 
 class ActiveTask:

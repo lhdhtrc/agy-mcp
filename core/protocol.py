@@ -20,3 +20,16 @@ def text_result(
     for note in notes or []:
         content.append({"type": "text", "text": f"[agy-mcp] {note}"})
     return {"content": content, "isError": is_error}
+
+
+def join_streams(code: int, out: str, err: str) -> str:
+    """把 stdout/stderr 合成一段可读文本；失败且没有输出时给出退出码。"""
+    body = out.strip()
+    err = err.strip()
+    if not body and err:
+        body = err
+    elif err:
+        body = f"{body}\n\n[stderr]\n{err}"
+    if code != 0 and not body:
+        body = f"agy exited with code {code}"
+    return body
