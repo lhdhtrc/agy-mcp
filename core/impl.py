@@ -86,8 +86,8 @@ from core.config import (
     _env_int,
     log,
 )
-# 协议层纯函数（已搬 text_result / join_streams，其余逐个搬）
-from core.protocol import join_streams, text_result  # noqa: E402,F401
+# 协议层纯函数（已搬 text_result / join_streams / parse_json_output，其余逐个搬）
+from core.protocol import join_streams, parse_json_output, text_result  # noqa: E402,F401
 # 额度解析、后台刷新、配额告警与 model=auto 选型已抽到 core/quota.py
 from core import quota as quota  # noqa: E402
 from core.quota import *  # noqa: E402,F401,F403 —— 名字多且会被测试补丁，集中导入
@@ -289,26 +289,6 @@ def usage_stats(limit: int = 200) -> Dict[str, Any]:
         "p95_ms": int(pick(0.95)),
         "max_ms": int(durations[-1]),
     }
-
-
-def parse_json_output(text: str) -> Optional[Dict[str, Any]]:
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        for line in reversed(text.splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    payload = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    continue
-        else:
-            return None
-    return payload if isinstance(payload, dict) else None
 
 
 def extract_answer(node: Any, depth: int = 0) -> Optional[str]:

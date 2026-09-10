@@ -33,3 +33,24 @@ def join_streams(code: int, out: str, err: str) -> str:
     if code != 0 and not body:
         body = f"agy exited with code {code}"
     return body
+
+
+def parse_json_output(text: str) -> Optional[Dict[str, Any]]:
+    """从 CLI 输出里取出 JSON 对象：先整体解析，失败再逐行从后往前找。"""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    payload = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        else:
+            return None
+    return payload if isinstance(payload, dict) else None
