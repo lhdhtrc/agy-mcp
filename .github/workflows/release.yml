@@ -17,7 +17,7 @@ jobs:
           python-version: "3.12"
       - name: Check the tagged commit
         run: |
-          python -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
+          python -m compileall -q core hooks main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
           python test_agy_mcp.py
       - name: Publish the release
         env:

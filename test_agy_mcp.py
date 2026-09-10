@@ -69,6 +69,12 @@ if "stream-json" in argv and "--input-format" in argv:
         if content.startswith("slow:"):
             # 代表一个很长的 agent 轮次；取消必须能把它杀掉
             time.sleep(float(os.environ.get("FAKE_AGY_SLOW_SEC", "60")))
+        if content.startswith("fail:"):
+            # 代表"轮次跑了但状态不是 SUCCESS"：用量记账必须还能落盘
+            emit({"event": "result", "result": {
+                "conversation_id": conversation, "status": "ERROR", "error": "fake failure",
+                "num_turns": turns, "usage": {"input_tokens": 5, "output_tokens": 0, "total_tokens": 5}}})
+            continue
         emit({"event": "step_update", "step_update": {
             "step_index": turns, "state": "ACTIVE", "step_type": "agent_response",
             "text_delta": "partial answer " + str(turns),
@@ -86,6 +92,10 @@ if "stream-json" in argv and "--input-format" in argv:
 prompt = ""
 if "-p" in argv:
     prompt = argv[argv.index("-p") + 1]
+if prompt.startswith("fail:"):
+    emit({"conversation_id": conversation, "status": "ERROR", "error": "fake failure",
+          "num_turns": 1, "usage": {"input_tokens": 5, "output_tokens": 0, "total_tokens": 5}})
+    sys.exit(0)
 emit({"conversation_id": conversation, "status": "SUCCESS", "response": "echo: " + prompt,
       "num_turns": 1, "usage": {"input_tokens": 7, "output_tokens": 1, "total_tokens": 8}})
 '''
@@ -977,11 +987,15 @@ def test_register_script_can_add_a_second_entry() -> None:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("[mcp_servers.other]\ncommand = 'x'\n")
 
-        block_b = reg.build_block("/py", "/tools/agy-mcp/agy_mcp.py", {"A": "1"}, server_id="antigravity-b")
+        block_b = reg.build_block(
+            "/py", ["/tools/agy-mcp/agy_mcp.py"], {"A": "1"}, server_id="antigravity-b"
+        )
         assert "[mcp_servers.antigravity-b]" in block_b
         assert reg.write_codex_config(path, block_b, False, False, "antigravity-b") == "updated"
 
-        block_a = reg.build_block("/py", "/tools/agy-mcp/agy_mcp.py", {}, server_id="antigravity")
+        block_a = reg.build_block(
+            "/py", ["/tools/agy-mcp/agy_mcp.py"], {}, server_id="antigravity"
+        )
         reg.write_codex_config(path, block_a, False, False, "antigravity")
 
         with open(path, encoding="utf-8") as handle:
@@ -1002,6 +1016,100 @@ def test_register_script_can_add_a_second_entry() -> None:
         entries = reg.codex_tool_entries(path, "antigravity-b")
         assert "antigravity-b" not in entries and "antigravity" not in entries
         assert "other" in entries
+
+
+def test_failed_turn_reports_the_error_instead_of_crashing() -> None:
+    """状态非 SUCCESS 的轮次要如实报错。
+
+    曾经会因为"用量记账用的 total_input 只在成功分支里赋值"而抛 UnboundLocalError，
+    用户看到的是内部错误、用量日志里也没有这条失败记录。
+    """
+    responses = run_server([ask(1, "fail:please")], {})
+    result = responses[1]["result"]
+    text = result["content"][0]["text"]
+    assert result["isError"] is True, result
+    assert "ERROR" in text and "fake failure" in text, text
+    assert "cannot access local variable" not in text, text
+
+    with open(os.path.join(STATE_DIR, "usage.jsonl"), encoding="utf-8") as handle:
+        last = json.loads(handle.readlines()[-1])
+    assert last["ok"] is False
+    assert last["total_input_tokens"] == 5, last  # 失败轮次也要把用量记下来
+
+
+def test_browser_hook_script_denies() -> None:
+    """钩子脚本按 agy 的 PreToolUse 契约返回硬拒决定。"""
+    proc = subprocess.run(
+        [sys.executable, os.path.join(HERE, "hooks", "deny_browser.py")],
+        input='{"toolCall": {"name": "read_browser_page", "args": {}}, "stepIdx": 3}',
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["decision"] == "deny"
+    assert payload["reason"].strip()
+
+
+def test_register_script_installs_the_browser_hook() -> None:
+    """--disable-browser 写/删 hooks.json：只动自己那条，别家的钩子和我方文件都要保住。"""
+    import register_agy_mcp as reg
+
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-hooks-") as tmp:
+        path = os.path.join(tmp, "hooks.json")
+        args = (sys.executable, os.path.join(HERE, "hooks", "deny_browser.py"))
+
+        assert reg.write_browser_hook(path, *args, remove=False, dry_run=False) == "updated"
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        assert reg.BROWSER_HOOK_NAME in data
+        entry = data[reg.BROWSER_HOOK_NAME]["PreToolUse"][0]
+        assert "browser" in entry["matcher"] and "playwright" in entry["matcher"]
+        assert "deny_browser.py" in entry["hooks"][0]["command"]
+        # 命令必须是 cmd 能直接跑的形式：带引号会被 cmd 拆坏，而"钩子跑不起来"= 每一轮都被判死
+        command = entry["hooks"][0]["command"]
+        if os.name == "nt":
+            assert '"' not in command, command
+        assert reg.verify_hook_command(command)[0] is True, command
+        assert reg.verify_hook_command(f'"{sys.executable}" "x.py"')[0] is (os.name != "nt")
+
+        # 幂等：内容一样就不再写
+        assert reg.write_browser_hook(path, *args, remove=False, dry_run=False) == "unchanged"
+
+        # 手工写的钩子必须原样保留
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"someone-else": {"enabled": False}}, handle)
+        reg.write_browser_hook(path, *args, remove=False, dry_run=False)
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        assert "someone-else" in data and reg.BROWSER_HOOK_NAME in data
+
+        # 卸载只摘自己那条
+        assert reg.write_browser_hook(path, *args, remove=True, dry_run=False) == "updated"
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        assert reg.BROWSER_HOOK_NAME not in data and "someone-else" in data
+
+        # 只剩自己一条时，卸载把文件删掉
+        reg.write_browser_hook(path, *args, remove=False, dry_run=False)
+        assert os.path.exists(path)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({reg.BROWSER_HOOK_NAME: {}}, handle)
+        assert reg.write_browser_hook(path, *args, remove=True, dry_run=False) == "removed"
+        assert not os.path.exists(path)
+
+        # 文件不是 JSON 时拒绝动手
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        try:
+            reg.write_browser_hook(path, *args, remove=False, dry_run=False)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("must refuse to rewrite a non-JSON hooks.json")
 
 
 def test_read_only_tools_do_not_queue_behind_a_turn() -> None:
@@ -1080,6 +1188,9 @@ TESTS = (
     test_interrupted_turn_keeps_sticky_settings,
     test_finished_jobs_do_not_block_orphan_cleanup,
     test_register_script_can_add_a_second_entry,
+    test_failed_turn_reports_the_error_instead_of_crashing,
+    test_browser_hook_script_denies,
+    test_register_script_installs_the_browser_hook,
     test_read_only_tools_do_not_queue_behind_a_turn,
 )
 

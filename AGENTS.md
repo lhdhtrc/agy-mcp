@@ -20,8 +20,8 @@
 - **跨模块调用走模块对象**（`from core import session` + `session.read_sessions()`），
   否则测试打在定义模块上的猴补丁会静默失效；只有常量可以按名导入。
 - 改代码必须保持离线测试通过：
-  `python3 -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py` 与
-  `python3 test_agy_mcp.py`（29+ 项，不需要网络、账号或 agy）。
+  `python3 -m compileall -q core hooks main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py` 与
+  `python3 test_agy_mcp.py`（40 项，不需要网络、账号或 agy）。
 - 涉及协议（`--input-format stream-json` 的事件形状）的改动，同步更新
   `tests/fixtures/stream_turn.ndjson` 和 `--self-test` 的形状校验。
 - 版本发布：推 `v*` tag 触发 `release.yml`（先跑测试再发版）。改版本号只改

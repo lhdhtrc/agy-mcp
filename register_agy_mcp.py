@@ -19,6 +19,8 @@
   python register_agy_mcp.py --remove        # 从两处注销
   python register_agy_mcp.py --id antigravity-b --env AGY_MCP_STATE_DIR=... --env AGY_CLI_HOME=...
                                              # 多账号：第二条条目，各用各的状态目录
+  python register_agy_mcp.py --disable-browser
+                                             # 顺带拒掉 agy 自带的浏览器工具（改走共享的 Codex 工具）
 """
 
 from __future__ import annotations
@@ -40,6 +42,11 @@ except ModuleNotFoundError:  # Python 3.9 / 3.10
 
 SERVER_ID = "antigravity"
 CODEX_TOOLS_ID = "node_repl"
+# 拒掉 agy 自带浏览器工具的钩子（见 hooks/deny_browser.py）
+BROWSER_HOOK_NAME = "agy-mcp-no-browser"
+# 工具名是 CORTEX_STEP_TYPE_* 去掉前缀转小写：browser_* / capture_browser_* /
+# click_browser_pixel / execute_browser_javascript / open_browser_url / read_browser_page …
+BROWSER_MATCHER = "(?i)(browser|playwright)"
 DEFAULT_AGY = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "agy", "bin", "agy.exe"
 )
@@ -59,12 +66,29 @@ def toml_literal(value: str) -> str:
     return "'" + value + "'"
 
 
-def build_block(python_exe: str, script_path: str, env: dict, server_id: str = SERVER_ID) -> str:
+def launch_spec(python_exe: str, script_path: Optional[str]) -> tuple:
+    """MCP 条目的 command / args。
+
+    仓库内运行时直接跑脚本文件；`pip install .` 装出来的环境里没有 agy_mcp.py，
+    就退回 PATH 上的 `agy-mcp` 命令（console_scripts 入口）。
+    """
+    if script_path and os.path.exists(script_path):
+        return python_exe, [script_path]
+    found = shutil.which("agy-mcp") or shutil.which("agy-mcp.exe")
+    if found:
+        return found, []
+    raise SystemExit(
+        f"找不到服务器脚本（{script_path}），PATH 上也没有 agy-mcp；"
+        "请用 --script 指定 agy_mcp.py，或先 `pip install .`"
+    )
+
+
+def build_block(command: str, args: list, env: dict, server_id: str = SERVER_ID) -> str:
     lines = [
         f"[mcp_servers.{server_id}]",
         'type = "stdio"',
-        f"command = {toml_literal(python_exe)}",
-        f"args = [{toml_literal(script_path)}]",
+        f"command = {toml_literal(command)}",
+        "args = [" + ", ".join(toml_literal(str(arg)) for arg in args) + "]",
         "startup_timeout_sec = 30",
         "tool_timeout_sec = 604800",
     ]
@@ -104,11 +128,11 @@ def upsert_block(text: str, block: str) -> str:
     return text + block
 
 
-def server_config(python_exe: str, script_path: str, env: dict) -> dict:
+def server_config(command: str, args: list, env: dict) -> dict:
     spec = {
         "type": "stdio",
-        "command": python_exe,
-        "args": [script_path],
+        "command": command,
+        "args": [str(arg) for arg in args],
         "startup_timeout_sec": 30,
         "tool_timeout_sec": 604800,
     }
@@ -278,11 +302,152 @@ def write_db(
         conn.close()
 
 
+def default_hooks_path() -> str:
+    """agy 的全局 hooks.json：TUI 里的 `/hooks` 命令也写这个文件。"""
+    return os.path.join(os.path.expanduser("~"), ".gemini", "config", "hooks.json")
+
+
+def browser_hook_entry(python_exe: str, hook_script: str, command: Optional[str] = None) -> dict:
+    return {
+        "PreToolUse": [
+            {
+                "matcher": BROWSER_MATCHER,
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command or hook_command(python_exe, hook_script),
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def hook_command(python_exe: str, hook_script: str) -> str:
+    """钩子命令行。
+
+    agy 用 `cmd /c <command>` 跑它，而 cmd 对"以引号开头的整串"有著名的剥离规则：
+    `"C:\\python.exe" "hook.py"` 会被拆坏，直接报"不是内部或外部命令"——更糟的是，
+    **钩子命令跑不起来会被当成拒绝**，那一轮就废了。所以 Windows 下不加引号，
+    并且安装前必须实测它能跑通（见 `verify_hook_command`）。
+    """
+    if os.name == "nt":
+        return f"{python_exe} {hook_script}"
+    return f'"{python_exe}" "{hook_script}"'
+
+
+def verify_hook_command(command: str) -> tuple:
+    """跑一次钩子命令，确认它真能返回 deny 决定；返回 (是否可用, 详情)。"""
+    shell = ["cmd", "/c", command] if os.name == "nt" else ["sh", "-c", command]
+    try:
+        proc = subprocess.run(
+            shell,
+            input='{"toolCall": {"name": "read_browser_page"}, "stepIdx": 3}',
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"could not run the hook command: {exc}"
+    text = (proc.stdout or "").strip()
+    try:
+        decision = json.loads(text)
+    except json.JSONDecodeError:
+        detail = (proc.stderr or text or f"exit {proc.returncode}").strip().replace("\n", " ")
+        return False, f"hook command did not print JSON: {detail[:200]}"
+    if not isinstance(decision, dict) or decision.get("decision") != "deny":
+        return False, f"unexpected hook output: {text[:200]}"
+    return True, "ok"
+
+
+def write_browser_hook(
+    path: str,
+    python_exe: str,
+    hook_script: str,
+    remove: bool,
+    dry_run: bool,
+    command: Optional[str] = None,
+) -> str:
+    """把"拒绝 agy 自带浏览器"的钩子合并进 hooks.json（不动别人写的钩子）。"""
+    original = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            original = handle.read()
+
+    hooks: dict = {}
+    if original.strip():
+        try:
+            hooks = json.loads(original)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"refusing to rewrite {path}: it is not valid JSON ({exc})")
+        if not isinstance(hooks, dict):
+            raise SystemExit(f"refusing to rewrite {path}: the top level is not an object")
+
+    if remove:
+        if BROWSER_HOOK_NAME not in hooks:
+            return "unchanged"
+        hooks.pop(BROWSER_HOOK_NAME)
+        if not hooks:
+            if not dry_run:
+                os.remove(path)
+            return "removed"
+    else:
+        hooks[BROWSER_HOOK_NAME] = browser_hook_entry(python_exe, hook_script, command)
+
+    text = json.dumps(hooks, ensure_ascii=False, indent=2) + "\n"
+    if text == original:
+        return "unchanged"
+    if dry_run:
+        return "would update"
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if original:
+        backup = f"{path}.bak-{time.strftime('%Y%m%d%H%M%S')}"
+        with open(backup, "w", encoding="utf-8") as handle:
+            handle.write(original)
+        print(f"backup: {backup}")
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    return "updated"
+
+
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(description="把 agy-mcp 注册到 cc-switch 与 Codex。")
     parser.add_argument("--python", default=sys.executable, help="跑这个 MCP 服务器用的 Python 解释器。")
-    parser.add_argument("--script", default=os.path.join(here, "agy_mcp.py"), help="agy_mcp.py 的路径。")
+    parser.add_argument(
+        "--script",
+        default=os.path.join(here, "agy_mcp.py"),
+        help="agy_mcp.py 的路径（文件不存在时会退回 PATH 上的 agy-mcp 命令）。",
+    )
+    parser.add_argument(
+        "--disable-browser",
+        action="store_true",
+        help=(
+            "给 agy 装一个 PreToolUse 钩子，硬拒它自带的浏览器工具"
+            "（playwright 驱动装不上；联网改走共享的 Codex 工具）。配 --remove 卸载。"
+        ),
+    )
+    parser.add_argument(
+        "--hooks-file",
+        default=None,
+        help="hooks.json 路径，默认 ~/.gemini/config/hooks.json。",
+    )
+    parser.add_argument(
+        "--hook-script",
+        default=os.path.join(here, "hooks", "deny_browser.py"),
+        help="拒绝浏览器用的钩子脚本路径。",
+    )
+    parser.add_argument(
+        "--hook-command",
+        default=None,
+        help=(
+            "直接指定钩子命令（默认由 --python/--hook-script 拼，Windows 下不加引号）。"
+            "路径里有空格之类的特殊情况时用它兜底。"
+        ),
+    )
     parser.add_argument(
         "--id",
         default=SERVER_ID,
@@ -331,9 +496,15 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只报告改动，不写盘。")
     args = parser.parse_args()
 
-    if not os.path.exists(args.script):
-        raise SystemExit(f"server script not found: {args.script}")
     server_id = (args.id or SERVER_ID).strip() or SERVER_ID
+    if args.disable_browser and not os.path.exists(args.hook_script):
+        raise SystemExit(f"hook script not found: {args.hook_script}")
+    if args.disable_browser and args.hook_command:
+        # 自定义命令也要先验证：钩子跑不起来会把那一轮直接判死
+        ok, detail = verify_hook_command(args.hook_command)
+        if not ok:
+            raise SystemExit(f"hook command check failed ({detail}); 换个写法再用 --hook-command 传")
+    command, argv = launch_spec(args.python, args.script)
 
     env = {} if (args.clear_env or args.remove) else read_existing_env(args.codex_config, server_id)
     if args.agy:
@@ -349,16 +520,30 @@ def main() -> int:
             raise SystemExit(f"--env expects KEY=VALUE, got: {item}")
         env[key.strip()] = value
 
-    config = server_config(args.python, args.script, env)
-    block = build_block(args.python, args.script, env, server_id)
+    config = server_config(command, argv, env)
+    block = build_block(command, argv, env, server_id)
 
     print(f"server id      : {server_id}")
     print(f"python         : {args.python}")
-    print(f"server script  : {args.script}")
+    print(f"server launch  : {command} {' '.join(argv)}".rstrip())
     print(f"agy binary     : {args.agy or '(not found - set AGY_BIN later)'}")
     print(f"env            : {', '.join(f'{k}={v}' for k, v in sorted(env.items())) or '(none)'}")
     print(f"codex config   : {args.codex_config} -> {write_codex_config(args.codex_config, block, args.remove, args.dry_run, server_id)}")
     print(f"cc-switch DB   : {args.db} -> {write_db(args.db, config, args.remove, args.dry_run, server_id)}")
+    if args.disable_browser:
+        hooks_path = args.hooks_file or default_hooks_path()
+        hook_cmd = args.hook_command or hook_command(args.python, args.hook_script)
+        if not args.remove and not args.dry_run:
+            ok, detail = verify_hook_command(hook_cmd)
+            if not ok:
+                raise SystemExit(
+                    f"refusing to install a hook that does not work ({detail})；"
+                    "agy 会把跑不起来的钩子当成拒绝，等于把每一轮都判死"
+                )
+        state = write_browser_hook(
+            hooks_path, args.python, args.hook_script, args.remove, args.dry_run, hook_cmd
+        )
+        print(f"agy hooks      : {hooks_path} -> {state}")
     entries = codex_tool_entries(args.codex_config, server_id)
     if args.list_codex_tools:
         if not entries:

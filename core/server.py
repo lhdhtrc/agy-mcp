@@ -408,3 +408,12 @@ def main(argv: List[str]) -> int:
         print(tool_status({})["content"][0]["text"])
         return 0
     return serve()
+
+
+def run() -> None:
+    """console_scripts 入口（`pip install .` 之后的 `agy-mcp` 命令）。"""
+    raise SystemExit(main(sys.argv[1:]))
+
+
+if __name__ == "__main__":  # 也让 `python -m core.server` 可用
+    raise SystemExit(main(sys.argv[1:]))

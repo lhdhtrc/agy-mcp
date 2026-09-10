@@ -503,6 +503,9 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     captured: Optional[str] = None
     status_value: Any = None
     usage_tokens: Dict[str, Any] = {}
+    # 整轮 usage 的输入合计：失败轮次也要记进用量日志，所以先给默认值，
+    # 否则"拿到 payload 但没走到成功分支"时 log_usage 会引用未赋值变量直接抛错。
+    total_input = 0
     denied: List[str] = []
     out = ""
     err = ""
@@ -672,6 +675,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     usage_tokens = {
                         key: value for key, value in usage.items() if isinstance(value, (int, float))
                     }
+                total_input = int(usage_tokens.get("input_tokens", 0) or 0)
                 raw_denied = payload.get("denied_actions")
                 if isinstance(raw_denied, list):
                     for item in raw_denied:
@@ -701,7 +705,6 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
 
             if succeeded and captured:
                 previous = entry.get("conversation_id")
-                total_input = int(usage_tokens.get("input_tokens", 0) or 0)
                 # 上下文大小取最后一步的输入，而不是整轮合计（那是各步骤之和）。
                 current_input = (
                     worker.last_step_input

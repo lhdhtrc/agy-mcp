@@ -23,6 +23,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Byte-compile
-        run: python -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
+        run: python -m compileall -q core hooks main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
       - name: Offline tests (no network, no quota)
         run: python test_agy_mcp.py

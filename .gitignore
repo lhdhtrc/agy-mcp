@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+# 打包产物（pyproject.toml 之后 pip/wheel 会生成）
+build/
+dist/
+*.egg-info/
