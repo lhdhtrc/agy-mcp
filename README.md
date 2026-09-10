@@ -165,6 +165,8 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 | --- | --- |
 | `antigravity_ask` | 提问 / 下达任务；默认续接同一会话，回答返回纯文本 |
 | `antigravity_quota` | 查看剩余额度（按模型组的周 / 5 小时窗口）；由 CLI 自身回答，**不扣额度** |
+| `antigravity_submit` | **后台跑一轮**，立刻返回 job id（长任务不阻塞客户端） |
+| `antigravity_job` | 查/列/清理后台任务（`action: get/list/forget`） |
 | `antigravity_sessions` | 查看 / 遗忘本服务器跟踪的会话，并列出 CLI 本地已有的会话 |
 | `antigravity_models` | 列出可用模型，返回结构化 JSON（`id` + `label`，id 可直接用于 `model` 参数） |
 | `antigravity_agents` | 列出可用 agent |
@@ -356,6 +358,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | 场景 | 怎么调 |
 | --- | --- |
 | 长任务（分析、写长文、逐条评审） | `timeout_sec: 900`（默认 300 秒常被真实的 agent 作业撞到，撞到就会"空回答"）；`AGY_MCP_DEFAULT_TIMEOUT_SEC` 可改全局默认 |
+| 长任务不阻塞 | 用 `antigravity_submit` 提交（立刻拿到 `job_id`），期间照常干别的，再用 `antigravity_job` 取结果 |
 | 不需要联网的分析 | `no_web: true`——明确禁止浏览。实测浏览器类尝试全是无效功（driver 装不上），会让一轮跑上百步、5 分钟被超时掐断 |
 | 评审改动 | `diff: true` + `prompt="逐条评审这些改动，按 file:line 给结论，指出风险与遗漏"` |
 | 只出方案不改代码 | `mode: "plan"` + 说明"只给方案，不要改文件" |

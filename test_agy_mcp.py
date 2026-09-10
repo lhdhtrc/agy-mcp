@@ -271,6 +271,8 @@ def test_mcp_handshake_and_tool_list() -> None:
         "antigravity_agents",
         "antigravity_sessions",
         "antigravity_quota",
+        "antigravity_submit",
+        "antigravity_job",
         "antigravity_status",
     ], names
     ask = next(tool for tool in responses[2]["result"]["tools"] if tool["name"] == "antigravity_ask")

@@ -1126,6 +1126,8 @@ FAST_TOOLS = frozenset(
         "antigravity_agents",
         "antigravity_quota",
         "antigravity_sessions",
+        "antigravity_submit",
+        "antigravity_job",
     }
 )
 
@@ -1362,6 +1364,27 @@ TOOLS: List[Dict[str, Any]] = [
             "Answered by the CLI itself: starts no turn and spends no quota."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "antigravity_submit",
+        "description": (
+            "Start an Antigravity turn in the background and return a job id immediately. "
+            "Use it for long jobs (deep analysis, long documents) so you are not blocked; "
+            "collect the answer later with antigravity_job. Same arguments as antigravity_ask."
+        ),
+        "inputSchema": ASK_SCHEMA,
+    },
+    {
+        "name": "antigravity_job",
+        "description": "Check, list or forget background jobs started with antigravity_submit.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "list", "forget"], "default": "get"},
+                "job_id": {"type": "string", "description": "Job id from antigravity_submit."},
+            },
+            "additionalProperties": False,
+        },
     },
     {
         "name": "antigravity_status",
@@ -2190,6 +2213,9 @@ HANDLERS = {
     "antigravity_agents": lambda args: tool_simple(["agent"], "agent"),
     "antigravity_sessions": tool_sessions,
     "antigravity_quota": tool_quota,
+    # defined further down: resolve lazily so the table can stay near the other tools
+    "antigravity_submit": lambda args: tool_submit(args),
+    "antigravity_job": lambda args: tool_job(args),
     "antigravity_status": tool_status,
 }
 
@@ -2381,6 +2407,72 @@ def serve() -> int:
 
 
 PROBE_PROMPT = "Reply with exactly one word: OK"
+
+
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
+
+
+def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a turn in the background so a long Antigravity job does not block the client."""
+    job_id = f"job-{int(time.time() * 1000)}-{len(JOBS) + 1}"
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "state": "running",
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "prompt_chars": len(str(args.get("prompt") or "")),
+            "session": args.get("session") or DEFAULT_SESSION,
+            "result": None,
+        }
+
+    def run() -> None:
+        try:
+            result = tool_ask(dict(args))
+            state = "failed" if result.get("isError") else "done"
+        except Exception as exc:  # noqa: BLE001 - a job must never kill the server
+            result, state = text_result(f"job failed: {exc}", True), "failed"
+        with JOBS_LOCK:
+            entry = JOBS.get(job_id)
+            if entry is not None:
+                entry.update({"state": state, "result": result, "finished": time.strftime("%Y-%m-%dT%H:%M:%S")})
+
+    threading.Thread(target=run, daemon=True).start()
+    return text_result(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "state": "running",
+                "hint": "poll with antigravity_job; the job keeps running while you do other work",
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def tool_job(args: Dict[str, Any]) -> Dict[str, Any]:
+    action = str(args.get("action") or "get").lower()
+    job_id = str(args.get("job_id") or "")
+    with JOBS_LOCK:
+        if action == "list":
+            jobs = [
+                {key: value for key, value in entry.items() if key != "result"}
+                for entry in JOBS.values()
+            ]
+            return text_result(json.dumps({"jobs": jobs}, ensure_ascii=False, indent=2))
+        if action == "forget":
+            if job_id:
+                JOBS.pop(job_id, None)
+            else:
+                JOBS.clear()
+            return text_result("jobs cleared")
+        entry = JOBS.get(job_id)
+        if entry is None:
+            return text_result(f"unknown job: {job_id or '(no job_id)'}", True)
+        state = entry["state"]
+        result = entry["result"]
+    if state == "running":
+        return text_result(json.dumps({"job_id": job_id, "state": "running"}, ensure_ascii=False))
+    return result if isinstance(result, dict) else text_result(str(result))
 
 
 def probe_protocol() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
