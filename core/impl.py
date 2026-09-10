@@ -59,10 +59,16 @@ from core.config import (  # noqa: E402
 # 会话进程 pid 的落盘与清理已抽到 core/session.py；
 # 会被测试猴补丁的 _is_agy_process / _read_worker_pids 必须走模块对象调用
 from core import session  # noqa: E402
+# 会话表本体已抽到 core/session.py（测试仍按顶层名调用，故按名导入）
 from core.session import (  # noqa: E402,F401
     _read_worker_pids,
     _write_worker_pids,
+    read_last_conversations,
+    read_sessions,
+    remember_partial_turn,
+    newest_conversation_since,
     track_worker_pid,
+    write_sessions,
 )
 
 # 护栏：CLI 是官方客户端，但额度本是给人驱动 agent 用的。串行化调用、限制每日总量，
@@ -82,8 +88,6 @@ ANSWER_KEYS = ("response", "result", "text", "output", "content", "message", "an
 DEFAULT_WORKER_IDLE_SEC = 900.0
 # 一个 Codex 会话对应一个 MCP 服务器实例，因此会话表按实例隔离，两个会话不会抢同一个
 # Antigravity 会话；新实例会沿用上一个实例的映射，除非检测到另一个实例仍活跃。
-INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
-DEFAULT_ADOPT_WINDOW_SEC = 120.0
 DEFAULT_LONG_CONTEXT_TOKENS = 100000
 DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
 DEFAULT_USAGE_ROTATE_MB = 5.0
@@ -258,120 +262,6 @@ def usage_stats(limit: int = 200) -> Dict[str, Any]:
         "p95_ms": int(pick(0.95)),
         "max_ms": int(durations[-1]),
     }
-
-
-def _read_store() -> Dict[str, Any]:
-    try:
-        with open(SESSIONS_PATH, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return {"instances": {}}
-    if not isinstance(data, dict):
-        return {"instances": {}}
-    if isinstance(data.get("instances"), dict):
-        return data
-    # 旧版扁平结构：当成一个可被接管的实例暴露出去。
-    return {"instances": {"legacy": {"sessions": data, "last_seen": 0.0}}}
-
-
-def read_sessions() -> Dict[str, Any]:
-    """Session map for THIS MCP server instance (= one Codex conversation)."""
-    instances = _read_store().get("instances") or {}
-    mine = instances.get(INSTANCE_ID)
-    if isinstance(mine, dict):
-        sessions = mine.get("sessions")
-        return sessions if isinstance(sessions, dict) else {}
-    others = [
-        (iid, data)
-        for iid, data in instances.items()
-        if isinstance(data, dict) and iid != INSTANCE_ID
-    ]
-    now = time.time()
-    alive = [iid for iid, data in others if now - float(data.get("last_seen") or 0) <= ADOPT_WINDOW_SEC]
-    if alive:
-        return {}  # a parallel Codex thread is active: give this one its own conversation
-    if others:
-        best = max(others, key=lambda kv: float(kv[1].get("last_seen") or 0))
-        sessions = best[1].get("sessions")
-        return dict(sessions) if isinstance(sessions, dict) else {}
-    return {}
-
-
-def write_sessions(sessions: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        store = _read_store()
-        instances = store.setdefault("instances", {})
-        now = time.time()
-        for iid in [
-            iid
-            for iid, data in list(instances.items())
-            if isinstance(data, dict) and now - float(data.get("last_seen") or 0) > 7 * 86400
-        ]:
-            instances.pop(iid, None)
-        instances[INSTANCE_ID] = {"sessions": sessions, "last_seen": now}
-        with open(SESSIONS_PATH, "w", encoding="utf-8") as handle:
-            json.dump(store, handle, ensure_ascii=False, indent=2)
-    except OSError as exc:
-        log(f"could not persist sessions: {exc}")
-
-
-def remember_partial_turn(
-    sessions: Dict[str, Any],
-    entry: Dict[str, Any],
-    session_name: str,
-    workspace: str,
-    worker: Optional["Worker"],
-) -> None:
-    """Keep the conversation id of a turn that failed mid-flight so the next call resumes it."""
-    if worker is None or not worker.conversation_id:
-        return
-    sessions[session_name] = {
-        "conversation_id": worker.conversation_id,
-        "workspace": workspace,
-        "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "calls": int(entry.get("calls", 0) or 0),
-        "num_turns": worker.turns,
-        "last_model": entry.get("last_model"),
-        "last_input_tokens": int(entry.get("last_input_tokens", 0) or 0),
-        "last_error": "turn interrupted; resumed on the next call",
-    }
-    write_sessions(sessions)
-
-
-def read_last_conversations() -> Dict[str, str]:
-    """workspace path -> conversation id, as tracked by the Antigravity CLI."""
-    try:
-        path = os.path.join(AGY_CLI_HOME, "cache", "last_conversations.json")
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if isinstance(data, dict):
-            return {str(key): str(value) for key, value in data.items()}
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def newest_conversation_since(since_ts: float) -> Optional[str]:
-    """Fallback capture: newest conversation store touched during our call window."""
-    conv_dir = os.path.join(AGY_CLI_HOME, "conversations")
-    try:
-        names = os.listdir(conv_dir)
-    except OSError:
-        return None
-    newest: Optional[str] = None
-    newest_mtime = 0.0
-    for name in names:
-        if not name.endswith(".db"):
-            continue
-        try:
-            mtime = os.path.getmtime(os.path.join(conv_dir, name))
-        except OSError:
-            continue
-        if mtime >= since_ts - 3 and mtime > newest_mtime:
-            newest_mtime = mtime
-            newest = name[: -len(".db")]
-    return newest
 
 
 def parse_json_output(text: str) -> Optional[Dict[str, Any]]:
@@ -709,7 +599,6 @@ class Worker:
 
 WORKERS: Dict[str, Worker] = {}
 WORKER_IDLE_SEC = _env_float("AGY_MCP_WORKER_IDLE_SEC", DEFAULT_WORKER_IDLE_SEC)
-ADOPT_WINDOW_SEC = _env_float("AGY_MCP_INSTANCE_WINDOW_SEC", DEFAULT_ADOPT_WINDOW_SEC)
 LONG_CONTEXT_TOKENS = _env_int("AGY_MCP_LONG_CONTEXT_TOKENS", DEFAULT_LONG_CONTEXT_TOKENS)
 SHUTDOWN_GRACE_SEC = _env_float("AGY_MCP_SHUTDOWN_GRACE_SEC", DEFAULT_SHUTDOWN_GRACE_SEC)
 AUTO_HANDOFF = _env_int("AGY_MCP_AUTO_HANDOFF", 0) != 0

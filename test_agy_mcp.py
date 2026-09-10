@@ -212,22 +212,22 @@ def test_sessions_are_scoped_per_instance() -> None:
     assert "instances" in store, "store must be namespaced by server instance"
 
     # 第二个实例（另一个客户端会话）在第一个仍活跃时不得继承它的会话。
-    real_id = agy_mcp.INSTANCE_ID
+    real_id = core.session.INSTANCE_ID
     try:
-        agy_mcp.INSTANCE_ID = "other-instance-1"
+        core.session.INSTANCE_ID = "other-instance-1"
         assert agy_mcp.read_sessions() == {}
     finally:
-        agy_mcp.INSTANCE_ID = real_id
+        core.session.INSTANCE_ID = real_id
 
     # 陈旧实例会被接管，所以重启后的服务器仍能接着原来的会话。
     store["instances"][real_id]["last_seen"] = 0
     with open(agy_mcp.SESSIONS_PATH, "w", encoding="utf-8") as handle:
         json.dump(store, handle)
     try:
-        agy_mcp.INSTANCE_ID = "other-instance-2"
+        core.session.INSTANCE_ID = "other-instance-2"
         assert agy_mcp.read_sessions()["default"]["conversation_id"] == "conversation-1"
     finally:
-        agy_mcp.INSTANCE_ID = real_id
+        core.session.INSTANCE_ID = real_id
 
 
 def test_resolve_agy_honours_env() -> None:
