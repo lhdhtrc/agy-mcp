@@ -17,6 +17,8 @@
   python register_agy_mcp.py                 # 注册（可重复执行）
   python register_agy_mcp.py --dry-run       # 只报告会改什么
   python register_agy_mcp.py --remove        # 从两处注销
+  python register_agy_mcp.py --id antigravity-b --env AGY_MCP_STATE_DIR=... --env AGY_CLI_HOME=...
+                                             # 多账号：第二条条目，各用各的状态目录
 """
 
 from __future__ import annotations
@@ -57,9 +59,9 @@ def toml_literal(value: str) -> str:
     return "'" + value + "'"
 
 
-def build_block(python_exe: str, script_path: str, env: dict) -> str:
+def build_block(python_exe: str, script_path: str, env: dict, server_id: str = SERVER_ID) -> str:
     lines = [
-        f"[mcp_servers.{SERVER_ID}]",
+        f"[mcp_servers.{server_id}]",
         'type = "stdio"',
         f"command = {toml_literal(python_exe)}",
         f"args = [{toml_literal(script_path)}]",
@@ -68,13 +70,13 @@ def build_block(python_exe: str, script_path: str, env: dict) -> str:
     ]
     if env:
         lines.append("")
-        lines.append(f"[mcp_servers.{SERVER_ID}.env]")
+        lines.append(f"[mcp_servers.{server_id}.env]")
         for key in sorted(env):
             lines.append(f"{key} = {toml_literal(env[key])}")
     return "\n".join(lines) + "\n"
 
 
-def strip_block(text: str) -> str:
+def strip_block(text: str, server_id: str = SERVER_ID) -> str:
     """删掉已有的 [mcp_servers.<id>...] 段，其余内容原样保留。"""
     lines = text.splitlines(keepends=True)
     out: List[str] = []
@@ -82,8 +84,8 @@ def strip_block(text: str) -> str:
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("["):
-            if stripped.startswith(f"[mcp_servers.{SERVER_ID}]") or stripped.startswith(
-                f"[mcp_servers.{SERVER_ID}."
+            if stripped.startswith(f"[mcp_servers.{server_id}]") or stripped.startswith(
+                f"[mcp_servers.{server_id}."
             ):
                 skipping = True
                 continue
@@ -115,13 +117,15 @@ def server_config(python_exe: str, script_path: str, env: dict) -> dict:
     return spec
 
 
-def write_codex_config(path: str, block: str, remove: bool, dry_run: bool) -> str:
+def write_codex_config(
+    path: str, block: str, remove: bool, dry_run: bool, server_id: str = SERVER_ID
+) -> str:
     original = ""
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as handle:
             original = handle.read()
 
-    text = strip_block(original) if remove else upsert_block(original, block)
+    text = strip_block(original, server_id) if remove else upsert_block(original, block)
     if text == original:
         return "unchanged"
 
@@ -143,7 +147,7 @@ def write_codex_config(path: str, block: str, remove: bool, dry_run: bool) -> st
     return "updated"
 
 
-def read_existing_env(path: str) -> dict:
+def read_existing_env(path: str, server_id: str = SERVER_ID) -> dict:
     """复用已经注册过的 env 表，这样直接重跑不会把代理设置丢掉。"""
     try:
         with open(path, "rb") as handle:
@@ -153,7 +157,7 @@ def read_existing_env(path: str) -> dict:
     servers = data.get("mcp_servers")
     if not isinstance(servers, dict):
         return {}
-    entry = servers.get(SERVER_ID)
+    entry = servers.get(server_id)
     if not isinstance(entry, dict):
         return {}
     env = entry.get("env")
@@ -162,7 +166,7 @@ def read_existing_env(path: str) -> dict:
     return {str(key): str(value) for key, value in env.items()}
 
 
-def codex_tool_entries(codex_config: str) -> dict:
+def codex_tool_entries(codex_config: str, server_id: str = SERVER_ID) -> dict:
     """Codex 自带一批工具类 MCP 服务器（带浏览器后端的 node_repl 等）。
 
     从 Codex 的配置里把它们读出来，agy 就能复用这些工具而不是自己去装
@@ -176,11 +180,17 @@ def codex_tool_entries(codex_config: str) -> dict:
     servers = data.get("mcp_servers")
     if not isinstance(servers, dict):
         return {}
-    # 跳过我们自己的服务器：把它共享出去，agy 就能再调用 agy-mcp，形成递归。
+    # 跳过我们自己（含另一个 id 的 agy-mcp 条目）：共享出去 agy 就能再调用 agy-mcp，形成递归。
+    def is_ours(name: str, entry: dict) -> bool:
+        if name in (server_id, SERVER_ID):
+            return True
+        parts = [str(entry.get("command") or "")] + [str(arg) for arg in entry.get("args") or []]
+        return any("agy_mcp.py" in part for part in parts)
+
     return {
         name: entry
         for name, entry in servers.items()
-        if isinstance(entry, dict) and name != SERVER_ID
+        if isinstance(entry, dict) and not is_ours(name, entry)
     }
 
 
@@ -222,20 +232,22 @@ def share_codex_tools(
     return "; ".join(done)
 
 
-def write_db(db_path: str, config: dict, remove: bool, dry_run: bool) -> str:
+def write_db(
+    db_path: str, config: dict, remove: bool, dry_run: bool, server_id: str = SERVER_ID
+) -> str:
     if not os.path.exists(db_path):
         return "skipped (no cc-switch DB)"
     conn = sqlite3.connect(db_path, timeout=15)
     try:
         cur = conn.cursor()
         if remove:
-            affected = cur.execute("DELETE FROM mcp_servers WHERE id = ?1", (SERVER_ID,)).rowcount
+            affected = cur.execute("DELETE FROM mcp_servers WHERE id = ?1", (server_id,)).rowcount
             if not dry_run:
                 conn.commit()
             return "removed" if affected else "unchanged"
 
         existing = cur.execute(
-            "SELECT server_config, enabled_codex FROM mcp_servers WHERE id = ?1", (SERVER_ID,)
+            "SELECT server_config, enabled_codex FROM mcp_servers WHERE id = ?1", (server_id,)
         ).fetchone()
         payload = json.dumps(config, ensure_ascii=False)
         if existing and existing[1] == 1:
@@ -253,8 +265,8 @@ def write_db(db_path: str, config: dict, remove: bool, dry_run: bool) -> str:
                     enabled_opencode, enabled_hermes)
                    VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, 0, 1, 0, 0, 0, 0)""",
                 (
-                    SERVER_ID,
-                    SERVER_ID,
+                    server_id,
+                    server_id,
                     payload,
                     "Antigravity CLI (agy) as an MCP tool: one-shot prompts on the signed-in Google account.",
                     json.dumps(["antigravity", "agy", "mcp", "codex"], ensure_ascii=False),
@@ -271,6 +283,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="把 agy-mcp 注册到 cc-switch 与 Codex。")
     parser.add_argument("--python", default=sys.executable, help="跑这个 MCP 服务器用的 Python 解释器。")
     parser.add_argument("--script", default=os.path.join(here, "agy_mcp.py"), help="agy_mcp.py 的路径。")
+    parser.add_argument(
+        "--id",
+        default=SERVER_ID,
+        metavar="SERVER_ID",
+        help=(
+            "MCP 条目的 id（默认 antigravity）。多账号时给第二条换个 id，"
+            "再配合 --env AGY_MCP_STATE_DIR/AGY_CLI_HOME 各用各的目录。"
+        ),
+    )
     parser.add_argument("--agy", default=resolve_default_agy(), help="agy 可执行文件的路径。")
     parser.add_argument(
         "--proxy",
@@ -312,8 +333,9 @@ def main() -> int:
 
     if not os.path.exists(args.script):
         raise SystemExit(f"server script not found: {args.script}")
+    server_id = (args.id or SERVER_ID).strip() or SERVER_ID
 
-    env = {} if (args.clear_env or args.remove) else read_existing_env(args.codex_config)
+    env = {} if (args.clear_env or args.remove) else read_existing_env(args.codex_config, server_id)
     if args.agy:
         env["AGY_BIN"] = args.agy
     if args.proxy:
@@ -328,16 +350,16 @@ def main() -> int:
         env[key.strip()] = value
 
     config = server_config(args.python, args.script, env)
-    block = build_block(args.python, args.script, env)
+    block = build_block(args.python, args.script, env, server_id)
 
-    print(f"server id      : {SERVER_ID}")
+    print(f"server id      : {server_id}")
     print(f"python         : {args.python}")
     print(f"server script  : {args.script}")
     print(f"agy binary     : {args.agy or '(not found - set AGY_BIN later)'}")
     print(f"env            : {', '.join(f'{k}={v}' for k, v in sorted(env.items())) or '(none)'}")
-    print(f"codex config   : {args.codex_config} -> {write_codex_config(args.codex_config, block, args.remove, args.dry_run)}")
-    print(f"cc-switch DB   : {args.db} -> {write_db(args.db, config, args.remove, args.dry_run)}")
-    entries = codex_tool_entries(args.codex_config)
+    print(f"codex config   : {args.codex_config} -> {write_codex_config(args.codex_config, block, args.remove, args.dry_run, server_id)}")
+    print(f"cc-switch DB   : {args.db} -> {write_db(args.db, config, args.remove, args.dry_run, server_id)}")
+    entries = codex_tool_entries(args.codex_config, server_id)
     if args.list_codex_tools:
         if not entries:
             print("codex tools    : (none found in Codex's config)")
