@@ -28,7 +28,7 @@ def _job_path(job_id: str) -> str:
 
 
 def write_job(job_id: str, payload: Dict[str, Any]) -> None:
-    """Jobs live on disk so a client restart does not lose track of a long run."""
+    """作业落盘：客户端重启也不会丢掉一个长作业的线索。"""
     try:
         os.makedirs(JOBS_DIR, exist_ok=True)
         tmp = _job_path(job_id) + ".tmp"
@@ -69,10 +69,9 @@ DETACHED_PROCESS = 0x00000008
 
 
 def collect_detached_job(job: Dict[str, Any]) -> Dict[str, Any]:
-    """Turn a finished detached run into a result: the process wrote its JSON to a file.
+    """把跑完的脱离进程转成结果：它把自己的 JSON 写在了文件里。
 
-    Nothing here depends on the server that started it, which is what lets a job
-    survive a client restart.
+    这里不依赖当初启动它的那个服务器，所以作业能扛过客户端重启。
     """
     if job.get("state") != "running" or pid_alive(int(job.get("pid") or 0)):
         return job

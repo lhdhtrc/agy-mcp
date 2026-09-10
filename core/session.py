@@ -96,7 +96,7 @@ def _read_store() -> Dict[str, Any]:
 
 
 def read_sessions() -> Dict[str, Any]:
-    """Session map for THIS MCP server instance (= one Codex conversation)."""
+    """本 MCP 服务器实例（等于一个 Codex 会话）自己的会话表。"""
     instances = _read_store().get("instances") or {}
     mine = instances.get(INSTANCE_ID)
     if isinstance(mine, dict):
@@ -144,7 +144,7 @@ def remember_partial_turn(
     workspace: str,
     worker: Optional["Worker"],
 ) -> None:
-    """Keep the conversation id of a turn that failed mid-flight so the next call resumes it."""
+    """记住中途失败的轮次的会话 id，好让下一次调用接着它继续。"""
     if worker is None or not worker.conversation_id:
         return
     sessions[session_name] = {
@@ -161,7 +161,7 @@ def remember_partial_turn(
 
 
 def read_last_conversations() -> Dict[str, str]:
-    """workspace path -> conversation id, as tracked by the Antigravity CLI."""
+    """工作目录 -> 会话 id，这是 Antigravity CLI 自己记的映射。"""
     try:
         path = os.path.join(AGY_CLI_HOME, "cache", "last_conversations.json")
         with open(path, "r", encoding="utf-8") as handle:
@@ -174,7 +174,7 @@ def read_last_conversations() -> Dict[str, str]:
 
 
 def newest_conversation_since(since_ts: float) -> Optional[str]:
-    """Fallback capture: newest conversation store touched during our call window."""
+    """兜底捕获：在我们这次调用时间窗内被改动过的、最新的那个会话存档。"""
     conv_dir = os.path.join(AGY_CLI_HOME, "conversations")
     try:
         names = os.listdir(conv_dir)

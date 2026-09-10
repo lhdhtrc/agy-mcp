@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 agy-mcp contributors
-"""Offline tests for agy-mcp: no network, no Antigravity quota, no `agy` required.
+"""agy-mcp 的离线测试：不需要网络、不需要 Antigravity 额度、不需要装 `agy`。
 
-Run directly (`python3 test_agy_mcp.py`) or through pytest.
+可以直接跑（`python3 test_agy_mcp.py`），也能用 pytest 跑。
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ def _fake_cli() -> str:
 
 
 def run_server_messages(requests: list, extra_env: dict) -> list:
-    """Drive the MCP server over stdio and return every parsed message it sent."""
+    """像客户端一样用 stdio 驱动 MCP 服务器，返回它发回的所有消息。"""
     env = {
         **os.environ,
         "AGY_MCP_STATE_DIR": STATE_DIR,
@@ -127,7 +127,7 @@ def run_server_messages(requests: list, extra_env: dict) -> list:
 
 
 def run_server(requests: list, extra_env: dict) -> dict:
-    """Drive the MCP server and return {request id: response}."""
+    """驱动 MCP 服务器，返回 {请求 id: 响应}。"""
     return {
         message["id"]: message
         for message in run_server_messages(requests, extra_env)
@@ -168,7 +168,7 @@ def stored_conversation_ids(state_dir: str) -> set:
 
 
 def latest_session_entry(state_dir: str) -> dict:
-    """The session record of the instance that wrote most recently."""
+    """最近写过盘的那个实例的会话记录。"""
     store = read_store(state_dir)
     instances = [data for data in store["instances"].values() if data.get("sessions")]
     newest = max(instances, key=lambda data: float(data.get("last_seen") or 0))
@@ -251,7 +251,7 @@ def test_disabled_actions_become_an_error() -> None:
 
 
 def test_mcp_handshake_and_tool_list() -> None:
-    """Drive the server over stdio exactly like a client would; no `agy` call happens."""
+    """完全按客户端的方式用 stdio 驱动服务器；这一条不会真的调用 `agy`。"""
     responses = run_server(
         [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -336,7 +336,7 @@ def test_handoff_starts_a_new_conversation_with_the_digest() -> None:
 
 
 def test_cancelled_turn_is_dropped_and_frees_the_session() -> None:
-    """Esc in the client sends notifications/cancelled; that must stop the turn, not just be ignored."""
+    """客户端按 Esc 会发 notifications/cancelled：必须真的停掉这一轮，而不是当没看见。"""
     with tempfile.TemporaryDirectory(prefix="agy-mcp-cancel-") as state:
         env = {
             **os.environ,
@@ -513,7 +513,7 @@ def test_sessions_record_token_totals() -> None:
 
 
 def test_orphaned_workers_are_reaped() -> None:
-    """A hard-killed server leaves session processes behind; the next start cleans them up."""
+    """被强杀的服务器会留下会话进程；下次启动要把它们清掉。"""
     sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
     try:
         agy_mcp._write_worker_pids([sleeper.pid])
@@ -545,7 +545,7 @@ def test_orphan_reaping_never_kills_unrelated_processes() -> None:
 
 
 def _make_repo_with_change() -> str:
-    """A throwaway git repo with one committed file and one uncommitted edit."""
+    """一次性 git 仓库：一个已提交的文件，外加一处未提交的改动。"""
     repo = tempfile.mkdtemp(prefix="agy-mcp-repo-")
     identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -617,7 +617,7 @@ def _quota_payload(gemini_percent: float, third_party_percent: float) -> dict:
 
 
 def test_effort_is_reconciled_with_the_model_id() -> None:
-    """The CLI rejects `--model gemini-3.8-flash-high --effort low`, so keep them consistent."""
+    """CLI 不接受 `--model gemini-3.8-flash-high --effort low`，所以两者要保持一致。"""
     model, effort, notes = core.quota.reconcile_model_and_effort("gemini-3.8-flash-high", "low", False)
     assert (model, effort) == ("gemini-3.8-flash-low", "low"), (model, effort)
     assert any("gemini-3.8-flash-low" in note for note in notes), notes
@@ -661,7 +661,7 @@ def test_effort_change_is_sticky_for_the_session() -> None:
 
 
 def test_stream_fixture_still_parses() -> None:
-    """Regression guard against CLI protocol drift: a recorded real stream must stay parsable."""
+    """防止 CLI 协议漂移的回归守卫：录下来的真实流必须一直能解析。"""
     fixture = os.path.join(HERE, "tests", "fixtures", "stream_turn.ndjson")
     with open(fixture, encoding="utf-8") as handle:
         events = [agy_mcp.parse_stream_line(line) for line in handle]
@@ -744,7 +744,7 @@ def test_orphan_reaping_never_kills_unrelated_processes() -> None:
 
 
 def test_read_only_tools_do_not_queue_behind_a_turn() -> None:
-    """`models` must answer while a long turn is still running, not after it."""
+    """长轮次还在跑的时候 `models` 就得能回答，而不是排在它后面。"""
     with tempfile.TemporaryDirectory(prefix="agy-mcp-fast-") as state:
         env = {
             **os.environ,

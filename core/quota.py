@@ -47,7 +47,7 @@ EFFORT_LEVELS = ("low", "medium", "high")
 
 
 def cached_models() -> Tuple[int, str]:
-    """`agy models` costs a network round trip (~4s); cache it for status calls."""
+    """`agy models` 每次都要一次网络往返（约 4 秒），所以缓存给 status 之类的调用用。"""
     if MODELS_CACHE.get("output") is not None and (
         time.time() - float(MODELS_CACHE.get("ts") or 0)
     ) < MODELS_CACHE_TTL:
@@ -58,7 +58,7 @@ def cached_models() -> Tuple[int, str]:
 
 
 def parse_models(text: str) -> List[Dict[str, str]]:
-    """`agy models` prints one `id<TAB>label` record per line."""
+    """`agy models` 每行输出一条 `id<TAB>标签` 记录。"""
     models: List[Dict[str, str]] = []
     for line in text.splitlines():
         line = line.strip()
@@ -71,7 +71,7 @@ def parse_models(text: str) -> List[Dict[str, str]]:
 
 
 def model_group(model_id: str) -> str:
-    """Which quota group a model id belongs to."""
+    """这个模型 id 属于哪个额度组。"""
     lowered = model_id.lower()
     if lowered.startswith("claude") or "gpt" in lowered:
         return "Claude and GPT models"
@@ -79,7 +79,7 @@ def model_group(model_id: str) -> str:
 
 
 def model_for_effort(model_id: str, effort: str) -> Optional[str]:
-    """Model ids embed the reasoning effort (`...-high`); return the same family at `effort`."""
+    """模型 id 里带着思考强度（如 `...-high`）；返回同系列里 `effort` 档位的那个 id。"""
     for suffix in EFFORT_LEVELS:
         if model_id.endswith("-" + suffix):
             return model_id[: -len(suffix)] + effort
@@ -89,10 +89,10 @@ def model_for_effort(model_id: str, effort: str) -> Optional[str]:
 def reconcile_model_and_effort(
     model_id: Optional[str], effort: Optional[str], model_was_explicit: bool
 ) -> Tuple[Optional[str], Optional[str], List[str]]:
-    """The CLI rejects `--model <x>-high` together with `--effort low`, so keep them consistent.
+    """CLI 不接受 `--model <x>-high` 配 `--effort low`，所以两者必须保持一致。
 
-    Returns (model, effort, notes). Model ids that embed an effort get rewritten to the
-    requested level; ids without one keep the model and drop the effort with a note.
+    返回 (模型, 强度, 说明)。id 里带强度的会被改写成请求的档位；不带强度的保留模型、
+    放弃 effort 并给出说明。
     """
     if not effort:
         return model_id, None, []
@@ -117,7 +117,7 @@ def reconcile_model_and_effort(
 
 
 def resolve_model(requested: Any) -> Tuple[Optional[str], List[str]]:
-    """Resolve the `model` argument: a concrete id, `auto` (quota aware), or the default."""
+    """解析 `model` 参数：具体 id、`auto`（按额度余量挑）或默认值。"""
     requested_text = str(requested).strip() if requested else ""
     if not requested_text:
         return (DEFAULT_MODEL_ID or None), []
@@ -144,7 +144,7 @@ def resolve_model(requested: Any) -> Tuple[Optional[str], List[str]]:
 
 
 def read_quota() -> Dict[str, Any]:
-    """`-p "/quota"` is answered by the CLI itself: no turn, no quota spent, no conversation."""
+    """`-p "/quota"` 由 CLI 自己回答：不起轮次、不扣额度、不产生会话。"""
     if QUOTA_CACHE.get("payload") and (time.time() - float(QUOTA_CACHE.get("ts") or 0)) < QUOTA_CACHE_TTL:
         return QUOTA_CACHE["payload"]
     code, out, err = run_agy(["-p", "/quota", "--output-format", "json"], timeout=90)
@@ -158,7 +158,7 @@ def read_quota() -> Dict[str, Any]:
 
 
 def summarize_quota(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Flatten the CLI's quota report into [{group, buckets:[{id,name,remaining_percent}]}]."""
+    """把 CLI 的额度报告压平成 [{group, buckets:[{id,name,remaining_percent}]}]。"""
     command = payload.get("command")
     groups: List[Dict[str, Any]] = []
     if isinstance(command, dict):
@@ -187,7 +187,7 @@ def summarize_quota(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def quota_headroom() -> Dict[str, float]:
-    """Per model group: how much of the tighter window (5h / weekly) is left, in percent."""
+    """每个模型组最紧的那个窗口（5 小时 / 周）还剩多少百分比。"""
     payload = QUOTA_CACHE.get("payload")
     headroom: Dict[str, float] = {}
     if not payload:
@@ -204,7 +204,7 @@ def quota_headroom() -> Dict[str, float]:
 
 
 def refresh_quota_in_background() -> None:
-    """Keep the quota cache warm off the critical path so warnings never add latency."""
+    """在后台把额度缓存焐热，这样告警永远不给轮次增加延迟。"""
     age = time.time() - float(QUOTA_CACHE.get("ts") or 0)
     if QUOTA_CACHE.get("payload") and age < QUOTA_REFRESH_SEC:
         return
@@ -224,7 +224,7 @@ def refresh_quota_in_background() -> None:
 
 
 def quota_warning() -> Optional[str]:
-    """Warn (once in a while) when a group's 5-hour or weekly window is nearly used up."""
+    """某个组的 5 小时或周窗口快用完时提醒一下（带冷却，不会每次都唠叨）。"""
     global _QUOTA_WARNED_AT
     if QUOTA_WARN_PERCENT <= 0:
         return None

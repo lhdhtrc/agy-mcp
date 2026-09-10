@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.7，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.2.0，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 >
 > 兼容性：目前只在 **Windows** 实机验证过（agy 1.2.0）。macOS / Linux 的代码路径已按平台写好、
 > 离线测试覆盖，但还没有实机跑过 `--self-test`；跑通后欢迎反馈。
@@ -13,7 +13,7 @@
 > [排障与兼容性](docs/troubleshooting.md)。
 >
 > 代码结构：实现都在 `core/` 包里，`main.py` 是正式入口，`agy_mcp.py` 是等价的兼容壳
-> （既有客户端配置写的就是它，继续可用）。拆分计划见 [docs/refactor-plan.md](docs/refactor-plan.md)。
+> （既有客户端配置写的就是它，继续可用）。模块分工见 [docs/modules.md](docs/modules.md)。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
@@ -392,8 +392,8 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 ## 开发
 
 ```bash
-python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 27 项离线测试：不需要网络、账号或 agy
+python3 -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
+python3 test_agy_mcp.py     # 29 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。

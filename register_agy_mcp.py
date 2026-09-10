@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 agy-mcp contributors
-"""Register the agy-mcp server into a Codex config (and cc-switch, when present).
+"""把 agy-mcp 注册进 Codex 配置（这台机器有 cc-switch 的话也一并写进去）。
 
-Two places are written, both idempotently:
+两处都会写，且都可重复执行：
 
-  1. the [mcp_servers.antigravity] block in ~/.codex/config.toml (backed up and
-     TOML-validated before writing);
-  2. if this machine uses cc-switch, the same server in its DB
-     (~/.cc-switch/cc-switch.db, mcp_servers table, enabled_codex = 1).
+  1. ~/.codex/config.toml 里的 [mcp_servers.antigravity] 段（写之前先备份并做 TOML 校验）；
+  2. 如果这台机器用 cc-switch，则往它的库里也写一份
+     （~/.cc-switch/cc-switch.db 的 mcp_servers 表，enabled_codex = 1）。
 
-Step 2 matters because cc-switch treats its database as the source of truth and
-re-projects the enabled servers into each client's live file, which would
-otherwise overwrite a hand-written entry in config.toml. It is skipped when no
-cc-switch database exists.
+第 2 步不能省：cc-switch 以自己的数据库为准，会把启用的服务器重新投影到各客户端的
+实际配置文件里，否则手写在 config.toml 里的条目会被它覆盖掉。没有 cc-switch 数据库时
+这一步自动跳过。
 
-Usage:
-  python register_agy_mcp.py                 # register (idempotent)
-  python register_agy_mcp.py --dry-run       # show what would change
-  python register_agy_mcp.py --remove        # unregister from both places
+用法：
+  python register_agy_mcp.py                 # 注册（可重复执行）
+  python register_agy_mcp.py --dry-run       # 只报告会改什么
+  python register_agy_mcp.py --remove        # 从两处注销
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ def resolve_default_agy() -> Optional[str]:
 
 
 def toml_literal(value: str) -> str:
-    """TOML literal string: backslashes stay literal (Windows paths)."""
+    """TOML 字面量字符串：反斜杠保持原样（Windows 路径要用）。"""
     if "'" in value:
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return "'" + value + "'"
@@ -77,7 +75,7 @@ def build_block(python_exe: str, script_path: str, env: dict) -> str:
 
 
 def strip_block(text: str) -> str:
-    """Remove an existing [mcp_servers.<id>...] block, keeping the rest intact."""
+    """删掉已有的 [mcp_servers.<id>...] 段，其余内容原样保留。"""
     lines = text.splitlines(keepends=True)
     out: List[str] = []
     skipping = False
@@ -146,7 +144,7 @@ def write_codex_config(path: str, block: str, remove: bool, dry_run: bool) -> st
 
 
 def read_existing_env(path: str) -> dict:
-    """Reuse the env table already registered so a plain re-run never drops the proxy."""
+    """复用已经注册过的 env 表，这样直接重跑不会把代理设置丢掉。"""
     try:
         with open(path, "rb") as handle:
             data = tomllib.load(handle)
@@ -165,10 +163,10 @@ def read_existing_env(path: str) -> dict:
 
 
 def codex_tool_entries(codex_config: str) -> dict:
-    """Codex ships its own tool MCP servers (node_repl with browser backends).
+    """Codex 自带一批工具类 MCP 服务器（带浏览器后端的 node_repl 等）。
 
-    Reading them out of Codex's config lets agy reuse those tools instead of
-    installing its own (the bundled Playwright driver no longer downloads).
+    从 Codex 的配置里把它们读出来，agy 就能复用这些工具而不是自己去装
+    （自带的 Playwright 驱动现在也下不动了）。
     """
     try:
         with open(codex_config, "rb") as handle:
@@ -189,7 +187,7 @@ def codex_tool_entries(codex_config: str) -> dict:
 def share_codex_tools(
     entries: dict, chosen: List[str], agy: Optional[str], remove: bool, dry_run: bool
 ) -> str:
-    """Register (or drop) Codex's own tool servers inside the Antigravity CLI."""
+    """把 Codex 自带的工具服务器注册进（或从）Antigravity CLI。"""
     if not agy:
         return "skipped (agy not found)"
     names = chosen or sorted(entries)
@@ -270,47 +268,46 @@ def write_db(db_path: str, config: dict, remove: bool, dry_run: bool) -> str:
 
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
-    parser = argparse.ArgumentParser(description="Register agy-mcp with cc-switch and Codex.")
-    parser.add_argument("--python", default=sys.executable, help="Python interpreter for the MCP server.")
-    parser.add_argument("--script", default=os.path.join(here, "agy_mcp.py"), help="Path to agy_mcp.py.")
-    parser.add_argument("--agy", default=resolve_default_agy(), help="Path to the agy executable.")
+    parser = argparse.ArgumentParser(description="把 agy-mcp 注册到 cc-switch 与 Codex。")
+    parser.add_argument("--python", default=sys.executable, help="跑这个 MCP 服务器用的 Python 解释器。")
+    parser.add_argument("--script", default=os.path.join(here, "agy_mcp.py"), help="agy_mcp.py 的路径。")
+    parser.add_argument("--agy", default=resolve_default_agy(), help="agy 可执行文件的路径。")
     parser.add_argument(
         "--proxy",
         default=None,
         metavar="URL",
-        help="Set HTTP_PROXY/HTTPS_PROXY for the MCP server, e.g. http://127.0.0.1:7897.",
+        help="给这个 MCP 服务器设置 HTTP_PROXY/HTTPS_PROXY，例如 http://127.0.0.1:7897。",
     )
     parser.add_argument(
         "--env",
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Extra environment variable for the MCP server, e.g. AGY_MCP_MAX_CALLS_PER_DAY=400.",
+        help="额外塞给这个 MCP 服务器的环境变量，例如 AGY_MCP_MAX_CALLS_PER_DAY=400。",
     )
     parser.add_argument("--codex-config", default=os.path.join(os.path.expanduser("~"), ".codex", "config.toml"))
     parser.add_argument("--db", default=os.path.join(os.path.expanduser("~"), ".cc-switch", "cc-switch.db"))
-    parser.add_argument("--remove", action="store_true", help="Unregister instead of register.")
+    parser.add_argument("--remove", action="store_true", help="注销，而不是注册。")
     parser.add_argument(
         "--clear-env",
         action="store_true",
-        help="Drop the env table already registered instead of merging into it.",
+        help="丢掉已注册的 env 表，而不是往里合并。",
     )
     parser.add_argument(
         "--share-codex-tools",
         nargs="*",
         metavar="NAME",
         help=(
-            "Register Codex's own MCP tool servers inside the Antigravity CLI so agy reuses "
-            "Codex's tools (browser included) instead of installing its own. No names = all of "
-            "them; --list-codex-tools shows what is available."
+            "把 Codex 自带的 MCP 工具服务器注册进 Antigravity CLI，让 agy 复用 Codex 的工具"
+            "（含浏览器）而不是自己装一套。不带名字表示全部；--list-codex-tools 可以看有哪些。"
         ),
     )
     parser.add_argument(
         "--list-codex-tools",
         action="store_true",
-        help="List the MCP servers Codex itself runs (candidates for --share-codex-tools).",
+        help="列出 Codex 自己跑着的 MCP 服务器（可作为 --share-codex-tools 的候选）。",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Report changes without writing.")
+    parser.add_argument("--dry-run", action="store_true", help="只报告改动，不写盘。")
     args = parser.parse_args()
 
     if not os.path.exists(args.script):

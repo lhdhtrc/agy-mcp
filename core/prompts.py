@@ -22,12 +22,12 @@ HANDOFF_PROMPT = (
 
 
 def handoff_prompt() -> str:
-    """The handoff digest prompt; override with AGY_MCP_HANDOFF_PROMPT."""
+    """交接摘要用的提示词；可用 AGY_MCP_HANDOFF_PROMPT 覆盖。"""
     return os.environ.get("AGY_MCP_HANDOFF_PROMPT") or HANDOFF_PROMPT
 
 
 def seed_prompt(prompt: str, digest: Optional[str]) -> str:
-    """Handoff: start a fresh conversation that has read a digest of the previous one."""
+    """交接：在新会话里先喂上一段旧会话的摘要。"""
     if not digest:
         return prompt
     return (
@@ -39,7 +39,7 @@ def seed_prompt(prompt: str, digest: Optional[str]) -> str:
 
 
 def attach_files(prompt: str, files: Any) -> str:
-    """Prepend file paths the agent should read itself (cheaper than pasting contents)."""
+    """把文件路径放到提示词前面，让 agent 自己去读（比粘贴全文便宜）。"""
     if not isinstance(files, list):
         return prompt
     paths = [str(item).strip() for item in files if str(item).strip()]
@@ -54,7 +54,7 @@ def attach_files(prompt: str, files: Any) -> str:
 
 
 def attach_no_web(prompt: str) -> str:
-    """Stop the agent from burning a turn on browser tools (its driver is broken here)."""
+    """别让 agent 把一轮耗在浏览器工具上（这里的驱动常常不可用）。"""
     return (
         "Do not browse the web or use any browser tool for this task; work only from the "
         "material given below and your own knowledge, and say so if something is unknown.\n\n"

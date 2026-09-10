@@ -27,7 +27,7 @@ from core.config import (
 from core.protocol import parse_stream_line, progress_from_event, summarize_delta  # noqa: F401
 
 class Worker:
-    """A long-lived `agy --input-format stream-json` process bound to one conversation."""
+    """一个常驻的 `agy --input-format stream-json` 进程，绑定在一个会话上。"""
 
     def __init__(self, key: str, argv: List[str], workspace: str) -> None:
         self.key = key
@@ -222,7 +222,7 @@ def shutdown_workers() -> None:
 
 
 def reap_orphan_workers() -> None:
-    """A server killed with SIGKILL/TerminateProcess cannot clean up its session processes."""
+    """被 SIGKILL / 任务管理器强杀的服务器来不及清理自己的会话进程，这里替它收拾。"""
     # 只要可能还有长作业在跑就不要清理：否则会把它的进程一起杀掉。
     pending = running_job_count()
     if pending:
@@ -250,7 +250,7 @@ def reap_orphan_workers() -> None:
 
 
 def _reaper_loop(interval: float = 60.0) -> None:
-    """Recycle idle session processes even when no call is coming in."""
+    """即使没有新调用进来，也要定期回收空闲的会话进程。"""
     while True:
         time.sleep(interval)
         try:
@@ -260,7 +260,7 @@ def _reaper_loop(interval: float = 60.0) -> None:
 
 
 def _install_signal_handlers() -> None:
-    """Make SIGTERM/SIGINT shut the child processes down too (atexit is not enough)."""
+    """让 SIGTERM/SIGINT 也把子进程带走（只靠 atexit 不够）。"""
 
     def handler(signum: int, _frame: Any) -> None:
         log(f"signal {signum}: stopping session processes")

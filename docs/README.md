@@ -4,7 +4,9 @@
 
 | 文档 | 内容 |
 | --- | --- |
+| [modules.md](modules.md) | 代码结构：`core/` 里每个模块的职责、依赖方向、改代码的纪律 |
 | [codex-tools.md](codex-tools.md) | 让 agy 复用 Codex 自带的 MCP 工具（含浏览器）：原因、做法、实测结果、长作业 |
 | [troubleshooting.md](troubleshooting.md) | 症状 → 原因 → 处理、已知边界与兼容性矩阵 |
+| [refactor-plan.md](refactor-plan.md) | 单文件拆成 `core/` 包的记录：步骤、纪律、踩过的坑（已完成） |
 
 总原则：**agy 复用 Codex 的能力（工具、浏览器，后续插件），只有推理用它自己的模型。**

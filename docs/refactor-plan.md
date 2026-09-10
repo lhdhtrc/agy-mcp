@@ -1,105 +1,81 @@
-# 拆分方案：从单文件到包结构
+# 拆分记录：从单文件到包结构
 
-现状：`agy_mcp.py` 约 2600 行、80+ 个顶层定义，已经不好读了。目标不是"重写"，
+**状态：已完成（v0.2.0）。** 本文保留当时的计划与纪律；实际结构见 [modules.md](modules.md)。
+
+起点是 `agy_mcp.py` 约 2600 行、80+ 个顶层定义，已经不好读也不好改。目标不是"重写"，
 而是**按职责切成模块，行为一字不改**，每一步都保持离线测试全绿。
 
-## 目标结构
-
-采用 `core/` 包 + `main.py` 入口的布局（包名不再与入口文件名冲突）：
+## 最终结构
 
 ```
 main.py                      # 正式入口：薄脚本，只做参数转发与 sys.exit(main(...))
 agy_mcp.py                   # 兼容壳：同样的薄脚本，保证既有客户端配置不用改
 core/                        # 全部实现
 ├── __init__.py              # 显式再导出全部顶层名（测试与兼容壳都依赖它）
-├── config.py                # 环境变量、路径、超时/阈值等常量（唯一读环境的地方）
-├── agy.py                   # CLI 定位与调用：resolve_agy / agy_command_prefix / run_agy / _git / pid_alive
-├── worker.py                # Worker 类、WORKERS 注册表、回收线程、信号处理、孤儿清理
+├── config.py                # 环境变量、路径、超时/阈值、服务器与协议常量
+├── agy.py                   # CLI 定位与调用：resolve_agy / run_agy / _git / pid_alive
+├── protocol.py              # 纯函数：结果渲染、JSON/流解析、答案提取
 ├── session.py               # 会话表（按实例隔离）、token 累计、进程 pid 记录
+├── worker.py                # Worker 类、WORKERS 注册表、回收线程、信号处理、孤儿清理
 ├── quota.py                 # 额度读取与解析、后台刷新、配额告警、模型 auto 选型
 ├── jobs.py                  # 后台作业：落盘、脱离进程启动、结果回收
-├── prompts.py               # 提示词拼装：attach_files / attach_diff / attach_no_web / 交接摘要
-├── tools.py                 # 八个工具的 handler（ask/quota/sessions/models/agents/status/submit/job）
-├── protocol.py              # MCP 协议层：handle_request / serve / send / 取消与进度
-└── server.py                # 组装入口：main()、--self-test、--status、--list-tools
+├── prompts.py               # 提示词拼装：files / diff / no_web / 交接摘要
+├── guard.py                 # 调用护栏与用量统计、跨进程文件锁、轮次串行化
+├── diag.py                  # 本地探测：工作树 diff、代理环境
+├── tasks.py                 # 异步任务、取消、进度通知、stdio 写出
+├── tools.py                 # 八个工具的 handler 与 schema
+└── server.py                # MCP 循环、取消/进度接线、--self-test 等子命令
 ```
+
+与原计划的差异：**协议循环留在 `server.py`，而 `protocol.py` 只放纯函数**；并新增了
+`guard.py` / `diag.py` / `tasks.py` 三个模块。原因是循环依赖——`worker` / `jobs` / `quota`
+都要用解析函数，而 `serve` 要用 `worker` 与 `tools`，把两者塞进同一个模块就会成环；
+`tasks.py` 的存在则让 `tools` 与 `server` 不必互相 import。
 
 根目录保留 `register_agy_mcp.py`、`test_agy_mcp.py`、`docs/`、`.github/`。
 
 **两个入口都保留**：`main.py` 是正式入口，`agy_mcp.py` 是兼容壳——既有客户端配置里写的是
 `python3 .../agy_mcp.py`，它必须继续可用。两者内容一致，都只做转发生效。
 
-好处：包名 `core` 与入口文件名不再冲突（原来的 `agy_mcp/` + `agy_mcp.py` 会触发"包优先于同名模块"的遮蔽问题）。
+好处：包名 `core` 与入口文件名不再冲突（原来的 `agy_mcp/` + `agy_mcp.py` 会触发"包优先于
+同名模块"的遮蔽问题）。
 
-## 迁移顺序（每步单独提交，每步都必须 29/29 通过）
+## 实际走的顺序（每步一次提交，每步 29/29 通过）
 
-1. **建包 + 薄入口**：拆出 `config.py` 与 `protocol.py` 里最独立的 `send/handle_request`，
-   `agy_mcp.py` 变成转发入口。这一步验证"包结构与旧入口共存"没问题。
-2. **抽 `agy.py`**：`resolve_agy` / `agy_command_prefix` / `run_agy` / `_git` / `pid_alive`。
-   这一层不含业务状态，风险最低。
-3. **抽 `session.py`**：`read_sessions` / `write_sessions` / 实例接管 / token 累计 / `workers.json`。
-   注意 `INSTANCE_ID` 是导入期算出来的，抽走后要确保仍只算一次。
-4. **抽 `worker.py`**：`Worker` + 注册表 + 回收线程 + 信号处理 + 孤儿清理。
-   它与 `session.py`（pid 记录）、`agy.py`（命令前缀）互相依赖，放第四步。
-5. **抽 `quota.py` + `prompts.py`**：无状态/纯函数居多，可并行。
-6. **抽 `jobs.py`**：作业落盘、脱离进程、结果回收；依赖 `agy.py` + `session.py` + `prompts.py`。
-7. **抽 `tools.py`**：八个 handler 集中一处；`tools.py` 只依赖上面各层，不再碰协议细节。
-8. **收尾**：`server.py` 只留组装与 CLI 子命令；`agy_mcp.py` 保持薄入口。
-
-## 约束与验收
-
-## 两个必须先解决的硬约束（第一步的关键）
-
-**1. 测试是按顶层名字调用的**：`test_agy_mcp.py` 里有 **24 个** `agy_mcp.xxx` 顶层引用
-（`resolve_model`、`QUOTA_CACHE`、`session_flags`、`extract_answer`、`read_sessions`、
-`_read_worker_pids`、`_write_worker_pids`、`_is_agy_process`、`_QUOTA_WARNED_AT`、`INSTANCE_ID`、
-`SESSIONS_PATH`、`DEFAULT_MODEL_ID`、`read_quota`、`cached_models`、`quota_warning`、
-`reconcile_model_and_effort`、`reap_orphan_workers`、`resolve_agy`、`merge_usage`、
-`parse_stream_line`、`progress_from_event`、`seed_prompt`、`write_sessions`、`py`）。
-
-拆分后 `core/__init__.py` **必须显式再导出**这些名字（以及后续新增的），否则测试会成片红。
-这是第一步必须一起做完的事，不是"顺手"。
-
-**2. 入口脚本不要自引用**：`main.py` 与 `agy_mcp.py` 都是脚本，只能写
-`from core.server import main`——绝不能写 `import agy_mcp` 去引用自己（历史上那个同名遮蔽问题
-已经用 `core` 包名绕开，但这条习惯仍要遵守，以免以后再撞上）。
-
-**3. 跨模块调用必须走"模块对象"，不能 import 具体名字**（这是拆分能否不打断测试的关键）：
-
-`test_agy_mcp.py` 里有 4 处**猴补丁**，都打在"定义它的模块"上：
-
-| 被补丁的名字 | 测试怎么用 |
+| 步骤 | 内容 |
 | --- | --- |
-| `INSTANCE_ID` | 临时改成 `other-instance-1/2`，验证实例隔离与接管 |
-| `_is_agy_process` | 替换成 `lambda pid: True`，验证孤儿清理确实会杀 |
-| `cached_models` | 替换成假模型列表，验证 `auto` 选型 |
-| `_QUOTA_WARNED_AT` | 归零，验证配额提示的冷却 |
+| 1 | 建 `core/` 包 + 薄入口，实现先整包搬进 `core/impl.py`，验证"包 + 旧入口"共存 |
+| 2 | 抽 `agy.py`（CLI 定位与调用） |
+| 3 | 抽 `config.py`（路径与常量）与 `session.py`（会话表、pid 记录） |
+| 4 | 抽 `worker.py`（常驻进程与回收） |
+| 5 | 抽 `jobs.py`（后台作业）与 `prompts.py`（提示词拼装） |
+| 6 | 抽 `quota.py`（额度与选型） |
+| 7 | 抽 `protocol.py` 的纯函数（渲染 / 解析 / 答案提取），顺手清掉各模块里的临时懒加载 |
+| 8 | 抽 `guard.py` / `diag.py` / `tasks.py`，再抽 `tools.py`（八个 handler）与 `server.py`（协议循环与入口） |
+| 9 | 删除 `core/impl.py`：两个入口改为 `from core.server import main`，测试改 `import core` |
 
-Python 的模块全局是**动态查表**，所以只要调用方在调用时才通过模块对象取属性
-（`session.read_sessions()`），补丁就生效；一旦写成 `from .session import read_sessions`
-再加 `read_sessions()`，调用方拿到的是**绑定时的副本**，补丁会静默失效——测试可能"变绿但没测到东西"，
-这比直接报错更危险。
-
-因此拆分纪律：
-
-- 模块之间一律 `from core import session, quota, ...` + `session.read_sessions()` 这种**属性调用**；
-- 只有**常量**（路径、阈值）可以直接 `from core.config import STATE_DIR`，因为没人会去补丁它们；
-- 测试要补丁时，改成补丁**拥有该状态的模块**（例如把 `agy_mcp.INSTANCE_ID` 改为 `core.session.INSTANCE_ID`），
-  并在测试里显式 import 那个模块——这一步要跟着对应拆分一起改，不能提前也不能延后。
-
-因此第一步的正确形态是：
-
-1. 建 `agy_mcp/` 包，`__init__.py` **把当前根文件里的全部顶层名再导出一遍**（先照搬、后精简）；
-2. 把根 `agy_mcp.py` 改成薄脚本：只做 `from agy_mcp.server import main` + `sys.exit(main(sys.argv[1:]))`；
-3. 跑三方验收：`python -m py_compile` 全部文件、`python3 test_agy_mcp.py`（29/29）、
-   `python3 agy_mcp.py --status`（证明薄入口仍可用）；
-4. 这一步**不拆任何逻辑**，只搭骨架——先证明"包 + 薄入口"能共存，再谈后面七步。
+## 验收与纪律（仍然有效）
 
 - **行为零变化**：只搬代码、改导入，不改逻辑。任何"顺手优化"另开提交。
-- **每步都要过**：`python3 -m py_compile`（所有文件）+ `python3 test_agy_mcp.py`（29/29）。
-  测试文件保持原样，它本来就是按公开函数名调用的，正好当重构的安全网。
+- **每步都要过**：`python3 -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py`
+  以及 `python3 test_agy_mcp.py`（29 项，全绿）。
 - **协议形状不变**：`tests/fixtures/stream_turn.ndjson` 与 `--self-test` 的形状校验照旧。
 - **入口兼容**：`python3 agy_mcp.py --status|--self-test|--list-tools` 与
   `python3 agy_mcp.py`（stdio 服务器）都必须继续可用。
 - **注释与文档中文**：见 [AGENTS.md](../AGENTS.md)。
-- **发版节奏**：整个拆分做完再打一个 tag（例如 v0.2.0），中间过程不发布。
+- **发版节奏**：整个拆分做完再打 tag（v0.2.0），中间过程不发布。
+
+## 三个踩过的坑
+
+**1. 测试是按顶层名字调用的。** `test_agy_mcp.py` 里有 24 个 `agy_mcp.xxx` 顶层引用，
+拆分后由 `core/__init__.py` 显式再导出；测试改成 `import core as agy_mcp`，
+需要补丁的状态（`INSTANCE_ID`、`_is_agy_process`、`cached_models`、`_QUOTA_WARNED_AT`）
+直接打在拥有它的模块上（`core.session` / `core.quota`）。
+
+**2. 入口脚本不要自引用。** `main.py` 与 `agy_mcp.py` 只能写 `from core.server import main`——
+绝不能写 `import agy_mcp` 去引用自己（同名遮蔽问题已经用 `core` 包名绕开，但习惯要守住）。
+
+**3. 搬代码时最危险的是"漏导入"。** `jobs.py`、`quota.py` 里有几处只在兜底路径上才会用到的
+名字（`pid_alive`、`read_sessions`、`join_streams`），离线测试全绿也照样是坏的。
+收尾时用 `pyflakes` 扫了一遍 `undefined name`，并手工验证了那些路径（配额读失败、
+作业结果回收）确实能走通。
