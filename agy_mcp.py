@@ -31,24 +31,23 @@ SERVER_VERSION = "0.1.8"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-# 0 = no limit: a real agent job may take many minutes, and the CLI's own print timeout
-# defaults to 5 minutes, which is what used to cut long turns off.
+# 0 表示不限时：真实的 agent 作业可能跑很久，而 CLI 自带的 print 超时默认只有 5 分钟，
+# 正是它把长任务掐断的。
 DEFAULT_TIMEOUT_SEC = int(os.environ.get("AGY_MCP_DEFAULT_TIMEOUT_SEC") or 0)
 TIMEOUT_GRACE_SEC = 30
-# Metadata calls (models, quota, version) still want a short leash so status cannot hang.
+# 元数据类调用（models / quota / version）仍需短超时，否则 status 之类可能一直挂着。
 METADATA_TIMEOUT_SEC = 300
 UNLIMITED_PRINT_TIMEOUT = "24h"
 
-# Guard rails: the CLI is the vendor's own client, but quota is meant for a human
-# driving an agent. Serialising calls and capping daily volume keeps the traffic
-# shape ordinary, which is the main thing a wrapper can do about account risk.
+# 护栏：CLI 是官方客户端，但额度本是给人驱动 agent 用的。串行化调用、限制每日总量，
+# 是为了让流量形状保持"正常"——这也是包装层在账号风险上唯一能做的事。
 STATE_DIR = os.environ.get("AGY_MCP_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".agy-mcp")
 LOCK_PATH = os.path.join(STATE_DIR, "call.lock")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
 SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
 _USAGE_SINCE_ROTATE = 0
-# Antigravity CLI keeps its own state (conversation ids, workspace index) here.
+# Antigravity CLI 自己的状态（会话 id、workspace 索引）放在这里。
 AGY_CLI_HOME = os.environ.get("AGY_CLI_HOME") or os.path.join(
     os.path.expanduser("~"), ".gemini", "antigravity-cli"
 )
@@ -57,12 +56,11 @@ DEFAULT_MIN_INTERVAL_SEC = 5.0
 DEFAULT_MAX_CALLS_PER_DAY = 200
 DEFAULT_SESSION = "default"
 ANSWER_KEYS = ("response", "result", "text", "output", "content", "message", "answer")
-# A fresh `agy -p` process re-does auth + model/quota init (~5s) on every call. A long-lived
-# `--input-format stream-json` process serves one conversation and answers warm turns in ~1.5s.
+# 每次新起 `agy -p` 进程都要重做鉴权与模型/额度初始化（约 5 秒）；常驻的
+# `--input-format stream-json` 进程服务一个会话，热轮约 1.5 秒。
 DEFAULT_WORKER_IDLE_SEC = 900.0
-# One Codex thread spawns one MCP server; scope sessions per server instance so two threads
-# never fight over the same Antigravity conversation. A fresh instance adopts the previous
-# instance's map unless another instance still looks alive.
+# 一个 Codex 会话对应一个 MCP 服务器实例，因此会话表按实例隔离，两个会话不会抢同一个
+# Antigravity 会话；新实例会沿用上一个实例的映射，除非检测到另一个实例仍活跃。
 INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
 DEFAULT_ADOPT_WINDOW_SEC = 120.0
 DEFAULT_LONG_CONTEXT_TOKENS = 100000
@@ -263,7 +261,7 @@ def _read_store() -> Dict[str, Any]:
         return {"instances": {}}
     if isinstance(data.get("instances"), dict):
         return data
-    # Legacy flat store: expose it as an adoptable instance.
+    # 旧版扁平结构：当成一个可被接管的实例暴露出去。
     return {"instances": {"legacy": {"sessions": data, "last_seen": 0.0}}}
 
 
@@ -481,7 +479,7 @@ def collect_diff(cwd: str, base: Optional[str], limit: int) -> Tuple[str, str]:
     target = base or "HEAD"
     code, out = _git(["diff", target], cwd)
     if code != 0:
-        # No commits yet (or an unknown ref): fall back to unstaged + staged.
+        # 还没有提交（或 ref 不存在）：退回到"未暂存 + 已暂存"。
         _, unstaged = _git(["diff"], cwd)
         _, staged = _git(["diff", "--cached"], cwd)
         out = unstaged + staged
@@ -586,7 +584,7 @@ def run_agy(
     command = agy_command_prefix()
     popen_kwargs: Dict[str, Any] = {}
     if os.name != "nt":
-        # Own process group so a timed-out run can be killed together with its helpers.
+        # 建独立进程组，超时被杀时能连带清理它拉起的子进程。
         popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
         command + argv,
@@ -599,7 +597,7 @@ def run_agy(
         errors="replace",
         **popen_kwargs,
     )
-    # Expose the process to a running tool call so a client cancellation can kill it.
+    # 把这个进程挂到当前调用上，客户端取消时才能杀掉它。
     task = current_task()
     if task is not None:
         task.process = proc
@@ -794,8 +792,8 @@ class Worker:
                     if isinstance(step_usage, dict) and isinstance(
                         step_usage.get("input_tokens"), (int, float)
                     ):
-                        # The last step's input is the real context size; the turn's total is
-                        # the sum over steps and is much larger when tool calls are involved.
+                        # 最后一步的输入才是真实上下文大小；整轮的合计是所有步骤之和，
+                        # 有工具调用时会远大于上下文。
                         self.last_step_input = int(step_usage["input_tokens"])
                 steps += 1
                 parsed = progress_from_event(event)
@@ -852,7 +850,7 @@ def reap_workers() -> None:
         if worker.busy:
             continue  # a long turn must not be reaped from under itself
         if worker.retire:
-            # Retired because the session switched model/effort: stop it between turns only.
+            # 因为会话切换了模型/强度而退休的进程：只在轮次之间停掉。
             worker.stop()
             WORKERS.pop(key, None)
             continue
@@ -922,7 +920,7 @@ def _is_agy_process(pid: int) -> bool:
 
 def reap_orphan_workers() -> None:
     """A server killed with SIGKILL/TerminateProcess cannot clean up its session processes."""
-    # Never clean up while a long job may still be alive: its process would be killed too.
+    # 只要可能还有长作业在跑就不要清理：否则会把它的进程一起杀掉。
     pending = running_job_count()
     if pending:
         log(f"skipping orphan cleanup: {pending} job(s) still marked running")
@@ -1237,11 +1235,11 @@ ASK_SCHEMA: Dict[str, Any] = {
         "effort": {
             "type": "string",
             "enum": ["low", "medium", "high"],
-            "description": "Reasoning effort for this Antigravity session.",
+            "description": "本会话的思考强度。",
         },
         "cwd": {
             "type": "string",
-            "description": "Working directory of the Antigravity session (its workspace).",
+            "description": "Antigravity 会话的工作目录（即它的 workspace）。",
         },
         "session": {
             "type": "string",
@@ -1254,7 +1252,7 @@ ASK_SCHEMA: Dict[str, Any] = {
         "new_session": {
             "type": "boolean",
             "default": False,
-            "description": "Start a fresh conversation for this session instead of resuming the stored one.",
+            "description": "为该会话重开一个会话，而不是续接已记录的那个。",
         },
         "handoff": {
             "type": "boolean",
@@ -1264,16 +1262,16 @@ ASK_SCHEMA: Dict[str, Any] = {
                 "answer there with that digest as background. Use when the conversation has grown long."
             ),
         },
-        "agent": {"type": "string", "description": "Optional Antigravity agent name."},
+        "agent": {"type": "string", "description": "可选的 Antigravity agent 名称。"},
         "mode": {
             "type": "string",
             "enum": ["plan", "accept-edits"],
-            "description": "Antigravity execution mode; omit to use the CLI default.",
+            "description": "Antigravity 执行模式；省略则用 CLI 默认。",
         },
         "sandbox": {
             "type": "boolean",
             "default": True,
-            "description": "Run the session with terminal restrictions enabled (default true).",
+            "description": "以终端受限方式运行会话（默认 true）。",
         },
         "skip_permissions": {
             "type": "boolean",
@@ -1287,17 +1285,17 @@ ASK_SCHEMA: Dict[str, Any] = {
         "continue_session": {
             "type": "boolean",
             "default": False,
-            "description": "Continue the most recent Antigravity conversation.",
+            "description": "续接最近一次 Antigravity 会话。",
         },
         "conversation": {
             "type": "string",
-            "description": "Resume a specific Antigravity conversation id (overrides the stored session).",
+            "description": "指定要续接的会话 id（覆盖本会话记录的那个）。",
         },
         "output_format": {
             "type": "string",
             "enum": ["text", "json"],
             "default": "text",
-            "description": "CLI print-mode output format returned verbatim.",
+            "description": "CLI print 模式的输出格式，原样返回。",
         },
         "json_schema": {
             "type": "string",
@@ -1309,17 +1307,17 @@ ASK_SCHEMA: Dict[str, Any] = {
         "disable_slash_commands": {
             "type": "boolean",
             "default": True,
-            "description": "Do not expand slash commands or skills in the prompt (default true).",
+            "description": "不展开提示词里的斜杠命令与技能（默认 true）。",
         },
         "timeout_sec": {
             "type": "number",
             "default": DEFAULT_TIMEOUT_SEC,
-            "description": "Maximum seconds to wait for the Antigravity CLI.",
+            "description": "等待 Antigravity CLI 的秒数上限。",
         },
         "extra_args": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Extra raw agy flags appended verbatim.",
+            "description": "追加的 agy 原始参数，原样拼接。",
         },
     },
     "required": ["prompt"],
@@ -1359,11 +1357,11 @@ TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "enum": ["list", "forget"],
                     "default": "list",
-                    "description": "list tracked sessions, or forget one (session) / all ('*').",
+                    "description": "list 列出跟踪的会话；forget 遗忘指定会话，传 '*' 清空全部。",
                 },
                 "session": {
                     "type": "string",
-                    "description": "Session name for action=forget; '*' clears every tracked session.",
+                    "description": "action=forget 时的会话名；'*' 表示清空全部跟踪的会话。",
                 },
             },
             "additionalProperties": False,
@@ -1393,7 +1391,7 @@ TOOLS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["get", "list", "forget"], "default": "get"},
-                "job_id": {"type": "string", "description": "Job id from antigravity_submit."},
+                "job_id": {"type": "string", "description": "antigravity_submit 返回的 job id。"},
             },
             "additionalProperties": False,
         },
@@ -1475,8 +1473,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 "compacting into a fresh conversation (AGY_MCP_AUTO_HANDOFF=1)"
             )
 
-    # Model and reasoning effort are sticky per session: a mid-conversation change keeps
-    # applying until the caller passes "default" (or names another model/effort).
+    # 模型与思考强度在会话内粘住：中途改一次会一直生效，直到调用方传 "default"
+    # （或改指定另一个模型/强度）。
     def _clears(value: Any) -> bool:
         return str(value or "").strip().lower() in ("", "default")
 
@@ -1522,7 +1520,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
         return text_result("timeout_sec must be a number.", True)
     if timeout_sec < 0:
         return text_result("timeout_sec must be zero (no limit) or a positive number.", True)
-    # 0 means "no limit": never pass a small --print-timeout, the CLI would cut the turn off.
+    # 0 表示不限时：绝不能传一个很小的 --print-timeout，否则 CLI 会把轮次掐断。
     print_timeout = f"{int(timeout_sec)}s" if timeout_sec > 0 else UNLIMITED_PRINT_TIMEOUT
     call_timeout = (timeout_sec + TIMEOUT_GRACE_SEC) if timeout_sec > 0 else None
 
@@ -1558,13 +1556,12 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
             started = time.time()
 
             if transport == "stream":
-                # The worker holds the live conversation, so the conversation id must NOT be part
-                # of the key: otherwise the first follow-up call would cold-start a second process.
+                # 会话由常驻进程持有，所以会话 id 不能进 key：否则第一次追问就会再冷启动一个进程。
                 base_flags = session_flags(args, None, continue_recent)
                 key = f"{session_name}|{workspace}|{' '.join(base_flags)}"
                 for stale in [k for k in WORKERS if k.startswith(f"{session_name}|{workspace}|") and k != key]:
-                    # A model/effort switch must never cut into work that is already running:
-                    # retire the old process and let it stop at the next turn boundary.
+                    # 切换模型/强度绝不能打断正在跑的工作：把旧进程标记为退休，
+                    # 等它到下一个轮次边界再停。
                     stale_worker = WORKERS[stale]
                     if stale_worker.busy:
                         stale_worker.retire = True
@@ -1705,7 +1702,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
             if succeeded and captured:
                 previous = entry.get("conversation_id")
                 total_input = int(usage_tokens.get("input_tokens", 0) or 0)
-                # Context size = the last step's input, not the turn total (which sums steps).
+                # 上下文大小取最后一步的输入，而不是整轮合计（那是各步骤之和）。
                 current_input = (
                     worker.last_step_input
                     if worker is not None and worker.last_step_input
@@ -1833,8 +1830,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
             "Antigravity produced no answer because the sandbox denied the tool it needed.", True, notes
         )
     if not answer and not out.strip():
-        # SUCCESS with no text: the turn ran but produced nothing, which almost always means
-        # it burned its budget on tool calls or hit the model's context limit.
+        # 状态 SUCCESS 却没有任何文字：这一轮跑了但没产出，通常是预算全花在工具调用上，
+        # 或者撞到了模型的上下文上限。
         spent = int(usage_tokens.get("input_tokens", 0) or 0)
         hint = (
             f"Antigravity finished without any text (status={status_value}, "
@@ -2228,7 +2225,7 @@ HANDLERS = {
     "antigravity_agents": lambda args: tool_simple(["agent"], "agent"),
     "antigravity_sessions": tool_sessions,
     "antigravity_quota": tool_quota,
-    # defined further down: resolve lazily so the table can stay near the other tools
+    # 这两个函数定义在后面：延迟解析，好让这张表跟其他工具放一起
     "antigravity_submit": lambda args: tool_submit(args),
     "antigravity_job": lambda args: tool_job(args),
     "antigravity_status": tool_status,
@@ -2287,8 +2284,8 @@ def handle_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def send(payload: Dict[str, Any]) -> None:
-    # `errors="replace"`: a child that hands back lone surrogates (invalid byte sequences it
-    # decoded with surrogateescape) must never take the whole server down on the way out.
+    # 用 errors="replace"：子进程回传孤立代理字符（它用 surrogateescape 解出的非法字节）时，
+    # 绝不能因为写响应就把整个服务器弄崩。
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
     sys.stdout.buffer.write(data + b"\n")
     sys.stdout.buffer.flush()
@@ -2359,16 +2356,15 @@ def serve() -> int:
         if not isinstance(message, dict):
             continue
 
-        # Tool calls can block for minutes; run them off the loop so a
-        # `notifications/cancelled` arriving meanwhile can stop the turn.
+        # 工具调用可能阻塞数分钟，所以放到循环之外执行，
+        # 这样期间到达的 `notifications/cancelled` 才能叫停这一轮。
         if message.get("method") == "tools/call" and message.get("id") is not None:
             params = message.get("params") or {}
             meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
             task = ActiveTask(message["id"], meta.get("progressToken"))
             register_task(task)
             if str(params.get("name") or "") in FAST_TOOLS:
-                # Read-only helpers do not touch a session process: never queue them
-                # behind a long Antigravity turn.
+                # 只读类工具不碰会话进程：绝不排在长轮次后面干等。
                 threading.Thread(target=_run_tool_call, args=(message, task), daemon=True).start()
             else:
                 TOOL_QUEUE.put((message, task))
@@ -2406,7 +2402,7 @@ def serve() -> int:
             else:
                 send({"jsonrpc": "2.0", "id": message.get("id"), "result": result})
 
-    # stdin closed: let quick in-flight calls flush their answer, then stop the rest.
+    # stdin 已关闭：先让很快的在跑调用把回答刷出去，再停掉剩下的。
     deadline = time.monotonic() + SHUTDOWN_GRACE_SEC
     while time.monotonic() < deadline:
         with TASKS_LOCK:
@@ -2548,8 +2544,8 @@ def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
         "cwd": os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd()),
     }
     try:
-        # Detached on purpose: the run must not depend on this server staying alive, so its
-        # output goes to a file instead of a pipe. Trade-off: no progress and no cancel.
+        # 故意脱离进程：这一轮不能依赖本服务器存活，所以输出写文件而不是管道。
+        # 代价是：没有进度通知，也不能取消。
         workspace = record["cwd"]
         prompt = str(args.get("prompt") or "")
         if args.get("files"):
@@ -2636,7 +2632,7 @@ def tool_job(args: Dict[str, Any]) -> Dict[str, Any]:
     with JOBS_LOCK:
         entry = JOBS.get(job_id)
     if entry is None:
-        # Not in memory: the server may have restarted, so look on disk.
+        # 内存里没有：服务器可能重启过，去磁盘上找。
         entry = read_job(job_id)
     if entry is None:
         return text_result(f"unknown job: {job_id or '(no job_id)'}", True)
