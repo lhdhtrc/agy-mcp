@@ -86,8 +86,15 @@ from core.config import (
     _env_int,
     log,
 )
-# 协议层纯函数（已搬 text_result / join_streams / parse_json_output，其余逐个搬）
-from core.protocol import join_streams, parse_json_output, text_result  # noqa: E402,F401
+# 协议层纯函数（已搬 text_result / join_streams / parse_json_output / 进度与流解析，剩余逐个搬）
+from core.protocol import (  # noqa: E402,F401
+    join_streams,
+    parse_json_output,
+    parse_stream_line,
+    progress_from_event,
+    summarize_delta,
+    text_result,
+)
 # 额度解析、后台刷新、配额告警与 model=auto 选型已抽到 core/quota.py
 from core import quota as quota  # noqa: E402
 from core.quota import *  # noqa: E402,F401,F403 —— 名字多且会被测试补丁，集中导入
@@ -439,37 +446,6 @@ def cancel_task(request_id: Any) -> bool:
     return True
 
 
-def summarize_delta(text: str, limit: int = 120) -> str:
-    """Collapse a streamed text delta into a short single-line preview."""
-    collapsed = " ".join(text.split())
-    if len(collapsed) <= limit:
-        return collapsed
-    return "…" + collapsed[-limit:]
-
-
-def parse_stream_line(line: str) -> Optional[Dict[str, Any]]:
-    """Parse one NDJSON line of the CLI's stream into an event dict (or None)."""
-    text = line.strip()
-    if not text:
-        return None
-    try:
-        event = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return event if isinstance(event, dict) else None
-
-
-def progress_from_event(event: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
-    """(label, text preview) for a step event; None when the event is not a step."""
-    if event.get("event") == "init":
-        return None
-    update = event.get("step_update")
-    update = update if isinstance(update, dict) else {}
-    step_type = str(update.get("step_type") or event.get("step_type") or "step")
-    state = str(update.get("state") or "")
-    label = f"{step_type} {state}".strip()
-    delta = update.get("text_delta")
-    return label, (summarize_delta(delta) if isinstance(delta, str) else None)
 
 
 def notify_progress(

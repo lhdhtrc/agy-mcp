@@ -54,3 +54,36 @@ def parse_json_output(text: str) -> Optional[Dict[str, Any]]:
         else:
             return None
     return payload if isinstance(payload, dict) else None
+
+
+def summarize_delta(text: str, limit: int = 120) -> str:
+    """把流式输出的一段文字压成单行预览（超长时保留结尾，便于看"正在写什么"）。"""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return "…" + collapsed[-limit:]
+
+
+def parse_stream_line(line: str) -> Optional[Dict[str, Any]]:
+    """解析流式输出的一行 NDJSON；不是合法 JSON 对象时返回 None。"""
+    text = line.strip()
+    if not text:
+        return None
+    try:
+        event = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def progress_from_event(event: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+    """从一步事件里取出（标签, 文字预览）；不是步骤事件时返回 None。"""
+    if event.get("event") == "init":
+        return None
+    update = event.get("step_update")
+    update = update if isinstance(update, dict) else {}
+    step_type = str(update.get("step_type") or event.get("step_type") or "step")
+    state = str(update.get("state") or "")
+    label = f"{step_type} {state}".strip()
+    delta = update.get("text_delta")
+    return label, (summarize_delta(delta) if isinstance(delta, str) else None)
