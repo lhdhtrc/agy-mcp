@@ -245,6 +245,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `AGY_BIN` | 自动探测 | `agy` 可执行文件路径 |
+| `AGY_MCP_AGY_CMD` | 无 | 用整条命令前缀替换 `agy`（如 `wsl agy`、容器包装器、测试用假 CLI） |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 无（**一般必须设**） | `agy` 访问 Google |
 | `NO_PROXY` | `localhost,127.0.0.1,::1` | 本机回环不走代理 |
 | `AGY_MCP_TRANSPORT` | `stream` | `stream` = 每会话驻留进程；`oneshot` = 每次调用新进程 |
@@ -254,6 +255,8 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `AGY_MCP_MAX_CALLS_PER_DAY` | `200` | 每日调用上限（`0` = 不限） |
 | `AGY_MCP_LONG_CONTEXT_TOKENS` | `100000` | 超过多少 input token 提醒 handoff（`0` = 关闭） |
 | `AGY_MCP_QUOTA_CACHE_SEC` | `60` | 额度结果缓存时长 |
+| `AGY_MCP_MODELS_CACHE_SEC` | `300` | `antigravity_status` 里模型列表的缓存时长 |
+| `AGY_MCP_HANDOFF_PROMPT` | 内置提示词 | 覆盖 handoff 摘要提示词（内置版要求"用与原对话相同的语言"输出） |
 | `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
 | `AGY_CLI_HOME` | `~/.gemini/antigravity-cli` | CLI 自身状态目录（一般不用改） |
 
@@ -293,9 +296,10 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 10 项离线测试：不需要网络、账号或 agy
 ```
 
+测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

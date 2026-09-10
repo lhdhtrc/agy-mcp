@@ -16,6 +16,7 @@ import atexit
 import json
 import os
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
@@ -59,12 +60,20 @@ INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
 DEFAULT_ADOPT_WINDOW_SEC = 120.0
 DEFAULT_LONG_CONTEXT_TOKENS = 100000
 HANDOFF_PROMPT = (
-    "把以上这次对话压缩成一份交接摘要，供另一段全新会话接手使用。要求：\n"
-    "1) 保留目标、已得出的结论、关键决策与理由、未完成事项、涉及的文件或路径、必须遵守的约束；\n"
-    "2) 只写事实与结论，不要客套；\n"
-    "3) 控制在 400 字以内；\n"
-    "4) 只输出摘要本身，不要输出任何前言后记。"
+    "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
+    "Requirements:\n"
+    "1) keep the goal, the conclusions reached, key decisions and why, open items, files or paths involved, "
+    "and constraints that must be respected;\n"
+    "2) facts and conclusions only, no pleasantries;\n"
+    "3) at most 400 words;\n"
+    "4) write the brief in the same language as the conversation above;\n"
+    "5) output the brief only, with no preamble or closing."
 )
+
+
+def handoff_prompt() -> str:
+    """The handoff digest prompt; override with AGY_MCP_HANDOFF_PROMPT."""
+    return os.environ.get("AGY_MCP_HANDOFF_PROMPT") or HANDOFF_PROMPT
 
 
 def _env_float(name: str, default: float) -> float:
@@ -233,6 +242,29 @@ def write_sessions(sessions: Dict[str, Any]) -> None:
         log(f"could not persist sessions: {exc}")
 
 
+def remember_partial_turn(
+    sessions: Dict[str, Any],
+    entry: Dict[str, Any],
+    session_name: str,
+    workspace: str,
+    worker: Optional["Worker"],
+) -> None:
+    """Keep the conversation id of a turn that failed mid-flight so the next call resumes it."""
+    if worker is None or not worker.conversation_id:
+        return
+    sessions[session_name] = {
+        "conversation_id": worker.conversation_id,
+        "workspace": workspace,
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "calls": int(entry.get("calls", 0) or 0),
+        "num_turns": worker.turns,
+        "last_model": entry.get("last_model"),
+        "last_input_tokens": int(entry.get("last_input_tokens", 0) or 0),
+        "last_error": "turn interrupted; resumed on the next call",
+    }
+    write_sessions(sessions)
+
+
 def read_last_conversations() -> Dict[str, str]:
     """workspace path -> conversation id, as tracked by the Antigravity CLI."""
     try:
@@ -383,19 +415,31 @@ def resolve_agy() -> str:
     )
 
 
+def agy_command_prefix() -> List[str]:
+    """Command prefix used to invoke the CLI.
+
+    `AGY_MCP_AGY_CMD` replaces it entirely (space-separated, no shell), which is handy for
+    wrappers, containers and tests: e.g. `AGY_MCP_AGY_CMD="wsl agy"` or a fake CLI script.
+    """
+    override = os.environ.get("AGY_MCP_AGY_CMD")
+    if override and override.strip():
+        return shlex.split(override)
+    return [resolve_agy()]
+
+
 def run_agy(
     argv: List[str],
     cwd: Optional[str] = None,
     timeout: Optional[float] = None,
 ) -> Tuple[int, str, str]:
     """Run one `agy` invocation, cleaning up the whole process group on timeout."""
-    exe = resolve_agy()
+    command = agy_command_prefix()
     popen_kwargs: Dict[str, Any] = {}
     if os.name != "nt":
         # Own process group so a timed-out run can be killed together with its helpers.
         popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
-        [exe] + argv,
+        command + argv,
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -473,12 +517,12 @@ class Worker:
         self.turns = 0
 
     def start(self) -> None:
-        exe = resolve_agy()
+        command = agy_command_prefix()
         popen_kwargs: Dict[str, Any] = {}
         if os.name != "nt":
             popen_kwargs["start_new_session"] = True
         self.proc = subprocess.Popen(
-            [exe] + self.argv,
+            command + self.argv,
             cwd=self.workspace,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -592,6 +636,31 @@ def shutdown_workers() -> None:
     for worker in list(WORKERS.values()):
         worker.stop()
     WORKERS.clear()
+
+
+def _reaper_loop(interval: float = 60.0) -> None:
+    """Recycle idle session processes even when no call is coming in."""
+    while True:
+        time.sleep(interval)
+        try:
+            reap_workers()
+        except Exception as exc:  # noqa: BLE001 - a reaper must never kill the server
+            log(f"reaper error: {exc!r}")
+
+
+def _install_signal_handlers() -> None:
+    """Make SIGTERM/SIGINT shut the child processes down too (atexit is not enough)."""
+
+    def handler(signum: int, _frame: Any) -> None:
+        log(f"signal {signum}: stopping session processes")
+        shutdown_workers()
+        raise SystemExit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handler)
+        except (AttributeError, OSError, ValueError):
+            pass
 
 
 atexit.register(shutdown_workers)
@@ -875,7 +944,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                         )
                         worker.start()
                         WORKERS[key] = worker
-                    digest_payload = worker.send(HANDOFF_PROMPT, timeout_sec + TIMEOUT_GRACE_SEC)
+                    digest_payload = worker.send(handoff_prompt(), timeout_sec + TIMEOUT_GRACE_SEC)
                     digest = extract_answer(digest_payload) or ""
                     merge_usage(usage_tokens, digest_payload)
                     worker.stop()
@@ -909,7 +978,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 digest = None
                 if handoff and conversation:
                     digest_argv = (
-                        ["-p", HANDOFF_PROMPT]
+                        ["-p", handoff_prompt()]
                         + session_flags(args, conversation, False)
                         + [f"--print-timeout", f"{int(timeout_sec)}s", "--output-format", "json"]
                     )
@@ -1027,14 +1096,38 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 }
             )
     except TimeoutError as exc:
+        remember_partial_turn(sessions, entry, session_name, workspace, worker)
         if worker is not None:
             worker.stop()
             WORKERS.pop(worker.key, None)
+        log_usage(
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "tool": "antigravity_ask",
+                "transport": transport,
+                "session": session_name,
+                "conversation": getattr(worker, "conversation_id", None),
+                "ok": False,
+                "error": str(exc),
+            }
+        )
         return text_result(f"Antigravity is busy: {exc}", True)
     except RuntimeError as exc:
+        remember_partial_turn(sessions, entry, session_name, workspace, worker)
         if worker is not None:
             worker.stop()
             WORKERS.pop(worker.key, None)
+        log_usage(
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "tool": "antigravity_ask",
+                "transport": transport,
+                "session": session_name,
+                "conversation": getattr(worker, "conversation_id", None),
+                "ok": False,
+                "error": str(exc),
+            }
+        )
         return text_result(f"Antigravity session failed: {exc}", True)
     except subprocess.TimeoutExpired:
         return text_result(f"agy did not finish within {int(timeout_sec) + TIMEOUT_GRACE_SEC}s.", True)
@@ -1077,6 +1170,19 @@ def tool_simple(argv: List[str], label: str) -> Dict[str, Any]:
 
 QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
 QUOTA_CACHE_TTL = _env_float("AGY_MCP_QUOTA_CACHE_SEC", 60.0)
+MODELS_CACHE: Dict[str, Any] = {"ts": 0.0, "output": None, "code": 1}
+MODELS_CACHE_TTL = _env_float("AGY_MCP_MODELS_CACHE_SEC", 300.0)
+
+
+def cached_models() -> Tuple[int, str]:
+    """`agy models` costs a network round trip (~4s); cache it for status calls."""
+    if MODELS_CACHE.get("output") is not None and (
+        time.time() - float(MODELS_CACHE.get("ts") or 0)
+    ) < MODELS_CACHE_TTL:
+        return int(MODELS_CACHE.get("code") or 0), str(MODELS_CACHE["output"])
+    code, out, err = run_agy(["models"], timeout=DEFAULT_TIMEOUT_SEC)
+    MODELS_CACHE.update({"ts": time.time(), "output": (out or err).strip(), "code": code})
+    return code, str(MODELS_CACHE["output"])
 
 
 def read_quota() -> Dict[str, Any]:
@@ -1177,9 +1283,10 @@ def tool_status(args: Dict[str, Any]) -> Dict[str, Any]:
     report["version"] = (out or err).strip()
     report["version_exit_code"] = code
 
-    code, out, err = run_agy(["models"], timeout=DEFAULT_TIMEOUT_SEC)
+    code, models_output = cached_models()
     report["models_exit_code"] = code
-    report["models_output"] = (out or err).strip()[:2000]
+    report["models_output"] = models_output[:2000]
+    report["models_cached_for_sec"] = MODELS_CACHE_TTL
     report["signed_in"] = code == 0
     return text_result(json.dumps(report, ensure_ascii=False, indent=2), code != 0)
 
@@ -1309,13 +1416,17 @@ def handle_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def send(payload: Dict[str, Any]) -> None:
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # `errors="replace"`: a child that hands back lone surrogates (invalid byte sequences it
+    # decoded with surrogateescape) must never take the whole server down on the way out.
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
     sys.stdout.buffer.write(data + b"\n")
     sys.stdout.buffer.flush()
 
 
 def serve() -> int:
     log(f"serving {SERVER_NAME} {SERVER_VERSION}")
+    _install_signal_handlers()
+    threading.Thread(target=_reaper_loop, daemon=True).start()
     while True:
         raw = sys.stdin.buffer.readline()
         if not raw:
