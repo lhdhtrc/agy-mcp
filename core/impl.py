@@ -86,6 +86,15 @@ from core.config import (  # noqa: E402
     _env_int,
     log,
 )
+# 提示词拼装（files / diff / no_web / 交接摘要）已抽到 core/prompts.py
+from core.prompts import (  # noqa: E402,F401
+    HANDOFF_PROMPT,
+    attach_diff,
+    attach_files,
+    attach_no_web,
+    handoff_prompt,
+    seed_prompt,
+)
 # 后台作业（落盘、脱离进程、结果回收）已抽到 core/jobs.py
 from core.jobs import (  # noqa: E402,F401
     DETACHED_PROCESS,
@@ -137,27 +146,6 @@ ANSWER_KEYS = ("response", "result", "text", "output", "content", "message", "an
 # `--input-format stream-json` 进程服务一个会话，热轮约 1.5 秒。
 # 一个 Codex 会话对应一个 MCP 服务器实例，因此会话表按实例隔离，两个会话不会抢同一个
 # Antigravity 会话；新实例会沿用上一个实例的映射，除非检测到另一个实例仍活跃。
-HANDOFF_PROMPT = (
-    "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
-    "Requirements:\n"
-    "1) keep the goal, the conclusions reached, key decisions and why, open items, files or paths involved, "
-    "and constraints that must be respected;\n"
-    "2) facts and conclusions only, no pleasantries;\n"
-    "3) at most 400 words;\n"
-    "4) write the brief in the same language as the conversation above;\n"
-    "5) output the brief only, with no preamble or closing."
-)
-
-
-def handoff_prompt() -> str:
-    """The handoff digest prompt; override with AGY_MCP_HANDOFF_PROMPT."""
-    return os.environ.get("AGY_MCP_HANDOFF_PROMPT") or HANDOFF_PROMPT
-
-
-
-
-
-
 class FileLock:
     """Cross-process advisory lock so parallel clients queue instead of racing."""
 
@@ -354,33 +342,6 @@ def merge_usage(target: Dict[str, Any], payload: Optional[Dict[str, Any]]) -> No
             target[key] = int(target.get(key, 0) or 0) + int(value)
 
 
-def seed_prompt(prompt: str, digest: Optional[str]) -> str:
-    """Handoff: start a fresh conversation that has read a digest of the previous one."""
-    if not digest:
-        return prompt
-    return (
-        "前情提要（上一段 Antigravity 会话的交接摘要）：\n"
-        f"{digest.strip()}\n\n"
-        "以上是背景。请在此基础上继续完成下面的任务：\n\n"
-        f"{prompt}"
-    )
-
-
-def attach_files(prompt: str, files: Any) -> str:
-    """Prepend file paths the agent should read itself (cheaper than pasting contents)."""
-    if not isinstance(files, list):
-        return prompt
-    paths = [str(item).strip() for item in files if str(item).strip()]
-    if not paths:
-        return prompt
-    listing = "\n".join(f"- {path}" for path in paths)
-    return (
-        "Read these files yourself with your file tools before answering:\n"
-        f"{listing}\n\n"
-        f"Then complete this task:\n\n{prompt}"
-    )
-
-
 def collect_diff(cwd: str, base: Optional[str], limit: int) -> Tuple[str, str]:
     """Capture the working tree diff locally.
 
@@ -412,23 +373,6 @@ def collect_diff(cwd: str, base: Optional[str], limit: int) -> Tuple[str, str]:
     if not parts:
         return "", "no uncommitted changes found, so no diff was attached"
     return "\n\n".join(parts), ""
-
-
-def attach_no_web(prompt: str) -> str:
-    """Stop the agent from burning a turn on browser tools (its driver is broken here)."""
-    return (
-        "Do not browse the web or use any browser tool for this task; work only from the "
-        "material given below and your own knowledge, and say so if something is unknown.\n\n"
-        f"{prompt}"
-    )
-
-
-def attach_diff(prompt: str, diff_text: str, source: str) -> str:
-    return (
-        f"Here is the current working tree state of `{source}` for context:\n\n"
-        f"{diff_text}\n\n"
-        f"Now complete this task:\n\n{prompt}"
-    )
 
 
 def mask_proxy(value: str) -> str:
@@ -590,8 +534,6 @@ def notify_progress(
                 },
             }
         )
-
-
 
 
 def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_recent: bool) -> List[str]:
