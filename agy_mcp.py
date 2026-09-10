@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 agy-mcp contributors
-"""agy-mcp: expose the Antigravity CLI (agy) to MCP clients such as Codex.
+"""agy-mcp：把 Antigravity CLI（agy）封装成 MCP 服务器，供 Codex 等 MCP 客户端调用。
 
-Transport: MCP over stdio, newline-delimited JSON-RPC 2.0 (no Content-Length framing).
-Only the Python standard library is used, so any MCP client can spawn this file
-directly without installing dependencies.
+传输方式：stdio 上的 MCP，换行分隔的 JSON-RPC 2.0（不使用 Content-Length 分帧）。
+只依赖 Python 标准库，任何 MCP 客户端都能直接拉起本文件，无需安装依赖。
 
-The CLI keeps its own Google sign-in state; this server never touches credentials.
+登录状态由 CLI 自己保管，本服务器从不接触凭据。
 """
 
 from __future__ import annotations
@@ -1198,7 +1197,7 @@ ASK_SCHEMA: Dict[str, Any] = {
     "properties": {
         "prompt": {
             "type": "string",
-            "description": "Prompt sent to the Antigravity CLI in non-interactive print mode.",
+            "description": "发送给 Antigravity CLI 的提示词（非交互 print 模式）。",
         },
         "files": {
             "type": "array",
@@ -1218,7 +1217,7 @@ ASK_SCHEMA: Dict[str, Any] = {
         },
         "diff_base": {
             "type": "string",
-            "description": "Git ref to diff against when `diff` is used (default: HEAD).",
+            "description": "配合 diff 指定对比的 git ref（默认 HEAD）。",
         },
         "no_web": {
             "type": "boolean",
@@ -1339,12 +1338,12 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "antigravity_models",
-        "description": "List the Antigravity models available to the signed-in agy account.",
+        "description": "列出当前 agy 账号可用的 Antigravity 模型。",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "antigravity_agents",
-        "description": "List the Antigravity agents defined for the signed-in agy account.",
+        "description": "列出当前 agy 账号可用的 agent。",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -1389,7 +1388,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "antigravity_job",
-        "description": "Check, list or forget background jobs started with antigravity_submit.",
+        "description": "查询、列出或清理由 antigravity_submit 启动的后台作业。",
         "inputSchema": {
             "type": "object",
             "properties": {
