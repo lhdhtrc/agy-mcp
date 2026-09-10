@@ -2472,6 +2472,67 @@ def running_job_count() -> int:
     return sum(1 for job in list_jobs() if job.get("state") == "running")
 
 
+DETACHED_PROCESS = 0x00000008
+
+
+def pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW,
+            ).stdout
+            return str(pid) in out
+        os.kill(pid, 0)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def collect_detached_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn a finished detached run into a result: the process wrote its JSON to a file.
+
+    Nothing here depends on the server that started it, which is what lets a job
+    survive a client restart.
+    """
+    if job.get("state") != "running" or pid_alive(int(job.get("pid") or 0)):
+        return job
+    try:
+        with open(str(job.get("out") or ""), encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        text = ""
+    payload = parse_json_output(text)
+    answer = extract_answer(payload) if payload else None
+    conversation = str(payload.get("conversation_id") or "") if payload else ""
+    if answer and conversation:
+        sessions = read_sessions()
+        name = str(job.get("session") or DEFAULT_SESSION)
+        entry = sessions.get(name) if isinstance(sessions.get(name), dict) else {}
+        sessions[name] = dict(
+            entry,
+            conversation_id=conversation,
+            workspace=job.get("cwd"),
+            updated=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            calls=int(entry.get("calls", 0) or 0) + 1,
+        )
+        write_sessions(sessions)
+    job = dict(
+        job,
+        state="done" if answer else "failed",
+        conversation=conversation or None,
+        finished=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        result=text_result(
+            answer or (text.strip()[-2000:] if text.strip() else "job finished without output"),
+            not answer,
+        ),
+    )
+    write_job(str(job.get("job_id")), job)
+    return job
+
+
 def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
     """Run a turn in the background so a long Antigravity job does not block the client."""
     job_id = f"job-{int(time.time() * 1000)}-{len(JOBS) + 1}"
@@ -2483,26 +2544,59 @@ def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
         "session": args.get("session") or DEFAULT_SESSION,
         "model": args.get("model"),
         "effort": args.get("effort"),
-        "pid": os.getpid(),
+        "pid": None,
+        "out": os.path.join(JOBS_DIR, f"{job_id}.out"),
+        "cwd": os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd()),
     }
+    try:
+        # Detached on purpose: the run must not depend on this server staying alive, so its
+        # output goes to a file instead of a pipe. Trade-off: no progress and no cancel.
+        workspace = record["cwd"]
+        prompt = str(args.get("prompt") or "")
+        if args.get("files"):
+            prompt = attach_files(prompt, args.get("files"))
+        if args.get("diff") or args.get("diff_base"):
+            diff_text, _ = collect_diff(workspace, args.get("diff_base"), MAX_DIFF_CHARS)
+            if diff_text:
+                prompt = attach_diff(prompt, diff_text, workspace)
+        session_name = str(record["session"])
+        entry = read_sessions().get(session_name)
+        entry = entry if isinstance(entry, dict) else {}
+        conversation = entry.get("conversation_id") if entry.get("workspace") == workspace else None
+        model, _ = resolve_model(args.get("model"))
+        model, effort, _ = reconcile_model_and_effort(model, args.get("effort"), bool(args.get("model")))
+        flags = session_flags(
+            {**args, "model": model or "", "effort": effort or ""},
+            str(conversation) if conversation else None,
+            False,
+        )
+        argv = (
+            ["-p", prompt]
+            + flags
+            + ["--print-timeout", UNLIMITED_PRINT_TIMEOUT, "--output-format", "json"]
+        )
+        detached = (
+            {"start_new_session": True}
+            if os.name != "nt"
+            else {"creationflags": DETACHED_PROCESS | CREATE_NO_WINDOW}
+        )
+        os.makedirs(JOBS_DIR, exist_ok=True)
+        with open(record["out"], "wb") as handle:
+            proc = subprocess.Popen(
+                agy_command_prefix() + argv,
+                cwd=workspace,
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                **detached,
+            )
+        record["pid"] = proc.pid
+        record["conversation"] = str(conversation) if conversation else None
+    except (OSError, subprocess.SubprocessError) as exc:
+        record.update({"state": "failed", "result": text_result(f"could not start job: {exc}", True)})
     write_job(job_id, record)
     with JOBS_LOCK:
-        JOBS[job_id] = dict(record, result=None)
-
-    def run() -> None:
-        try:
-            result = tool_ask(dict(args))
-            state = "failed" if result.get("isError") else "done"
-        except Exception as exc:  # noqa: BLE001 - a job must never kill the server
-            result, state = text_result(f"job failed: {exc}", True), "failed"
-        with JOBS_LOCK:
-            entry = JOBS.get(job_id)
-            if entry is not None:
-                entry.update({"state": state, "result": result, "finished": time.strftime("%Y-%m-%dT%H:%M:%S")})
-        saved = dict(record, state=state, result=result, finished=time.strftime("%Y-%m-%dT%H:%M:%S"))
-        write_job(job_id, saved)
-
-    threading.Thread(target=run, daemon=True).start()
+        JOBS[job_id] = record
     return text_result(
         json.dumps(
             {
@@ -2547,6 +2641,8 @@ def tool_job(args: Dict[str, Any]) -> Dict[str, Any]:
         entry = read_job(job_id)
     if entry is None:
         return text_result(f"unknown job: {job_id or '(no job_id)'}", True)
+    if entry.get("state") == "running":
+        entry = collect_detached_job(entry)
     state = entry.get("state")
     result = entry.get("result")
     if state == "running":

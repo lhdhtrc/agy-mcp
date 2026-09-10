@@ -50,3 +50,14 @@ Ask explicitly the first time: *"Use the node_repl MCP tool to fetch <url> and r
 - This rides on a private Codex component. If it breaks, fall back to the Playwright download host
   above, or run the task in the Antigravity IDE.
 - Those tools run with agy's permissions: keep the sandbox on and only share servers you trust.
+
+## Long jobs that outlive the client
+
+`antigravity_submit` starts the CLI **detached** (`agy -p … --output-format json`, stdout to
+`~/.agy-mcp/jobs/<id>.out`), so the run is not tied to the MCP server process:
+
+- the client may restart, the server may die — the job keeps going;
+- `antigravity_job` reads `~/.agy-mcp/jobs/` from disk, spots a finished process, parses the JSON,
+  records the conversation id back into the session store and returns the answer;
+- the trade-off is deliberate: a detached run has **no progress notifications and cannot be
+  cancelled**. Use a normal `antigravity_ask` (resident session process) when you want those.
