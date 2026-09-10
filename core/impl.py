@@ -30,7 +30,16 @@ SERVER_NAME = "antigravity"
 SERVER_VERSION = "0.1.8"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
-CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+# 进程控制（定位 CLI、跑命令、杀进程树）已抽到 core/agy.py
+from core.agy import (
+    CREATE_NO_WINDOW,
+    _git,
+    agy_command_prefix,
+    kill_process_tree,
+    pid_alive,
+    resolve_agy,
+    run_agy,
+)
 # 0 表示不限时：真实的 agent 作业可能跑很久，而 CLI 自带的 print 超时默认只有 5 分钟，
 # 正是它把长任务掐断的。
 DEFAULT_TIMEOUT_SEC = int(os.environ.get("AGY_MCP_DEFAULT_TIMEOUT_SEC") or 0)
@@ -448,24 +457,6 @@ def attach_files(prompt: str, files: Any) -> str:
     )
 
 
-def _git(args: List[str], cwd: str, timeout: float = 30) -> Tuple[int, str]:
-    try:
-        proc = subprocess.run(
-            ["git"] + args,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            creationflags=CREATE_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return 1, str(exc)
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-
-
 def collect_diff(cwd: str, base: Optional[str], limit: int) -> Tuple[str, str]:
     """Capture the working tree diff locally.
 
@@ -538,84 +529,6 @@ def log(message: str) -> None:
     sys.stderr.flush()
 
 
-def resolve_agy() -> str:
-    """Locate the agy executable: env override, PATH, then known install dirs."""
-    override = os.environ.get("AGY_BIN")
-    if override and os.path.exists(override):
-        return override
-
-    found = shutil.which("agy") or shutil.which("agy.exe")
-    if found:
-        return found
-
-    exe = "agy.exe" if os.name == "nt" else "agy"
-    candidates = []
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        candidates.append(os.path.join(local_app_data, "agy", "bin", exe))
-    candidates.append(os.path.join(os.path.expanduser("~"), ".local", "bin", exe))
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-
-    raise FileNotFoundError(
-        "agy executable not found; install the Antigravity CLI or set AGY_BIN"
-    )
-
-
-def agy_command_prefix() -> List[str]:
-    """Command prefix used to invoke the CLI.
-
-    `AGY_MCP_AGY_CMD` replaces it entirely (space-separated, no shell), which is handy for
-    wrappers, containers and tests: e.g. `AGY_MCP_AGY_CMD="wsl agy"` or a fake CLI script.
-    """
-    override = os.environ.get("AGY_MCP_AGY_CMD")
-    if override and override.strip():
-        return shlex.split(override)
-    return [resolve_agy()]
-
-
-def run_agy(
-    argv: List[str],
-    cwd: Optional[str] = None,
-    timeout: Optional[float] = None,
-) -> Tuple[int, str, str]:
-    """Run one `agy` invocation, cleaning up the whole process group on timeout."""
-    command = agy_command_prefix()
-    popen_kwargs: Dict[str, Any] = {}
-    if os.name != "nt":
-        # 建独立进程组，超时被杀时能连带清理它拉起的子进程。
-        popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(
-        command + argv,
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=CREATE_NO_WINDOW,
-        encoding="utf-8",
-        errors="replace",
-        **popen_kwargs,
-    )
-    # 把这个进程挂到当前调用上，客户端取消时才能杀掉它。
-    task = current_task()
-    if task is not None:
-        task.process = proc
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_process_tree(proc)
-        try:
-            out, err = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            out, err = "", ""
-        raise
-    finally:
-        if task is not None:
-            task.process = None
-    return proc.returncode, out or "", err or ""
-
-
 def text_result(text: str, is_error: bool = False, notes: Optional[List[str]] = None) -> Dict[str, Any]:
     content = [{"type": "text", "text": text}]
     for note in notes or []:
@@ -633,28 +546,6 @@ def join_streams(code: int, out: str, err: str) -> str:
     if code != 0 and not body:
         body = f"agy exited with code {code}"
     return body
-
-
-def kill_process_tree(proc: subprocess.Popen) -> None:
-    """agy spawns helper processes; make sure a stopped worker leaves none behind."""
-    try:
-        if proc.poll() is not None:
-            return
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW,
-                timeout=15,
-            )
-        else:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError):
-        try:
-            proc.kill()
-        except OSError:
-            pass
 
 
 class Worker:
@@ -2468,22 +2359,6 @@ def running_job_count() -> int:
 
 
 DETACHED_PROCESS = 0x00000008
-
-
-def pid_alive(pid: int) -> bool:
-    if not pid:
-        return False
-    try:
-        if os.name == "nt":
-            out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW,
-            ).stdout
-            return str(pid) in out
-        os.kill(pid, 0)
-        return True
-    except (OSError, subprocess.SubprocessError):
-        return False
 
 
 def collect_detached_job(job: Dict[str, Any]) -> Dict[str, Any]:
