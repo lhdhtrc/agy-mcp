@@ -4,7 +4,10 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.4，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.1.5，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+>
+> 兼容性：目前只在 **Windows** 实机验证过（agy 1.2.0）。macOS / Linux 的代码路径已按平台写好、
+> 离线测试覆盖，但还没有实机跑过 `--self-test`；跑通后欢迎反馈。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
@@ -253,7 +256,8 @@ Claude and GPT models    Five Hour Limit Remaining     100%
 | `conversation` | 无 | 直接指定要续接的会话 id |
 | `continue_session` | `false` | 让 CLI 自己挑最近一个会话续接 |
 | `cwd` | 当前工作目录 | 作为 Antigravity 会话的 workspace |
-| `model` / `agent` / `effort` | 无 | 透传 `--model` / `--agent` / `--effort` |
+| `model` | `gemini-3.8-flash-high` | 模型 id（见 `antigravity_models`），或 `auto`：按剩余额度自动挑一组还有余量的模型 |
+| `agent` / `effort` | 无 | 透传 `--agent` / `--effort` |
 | `mode` | 无 | `plan` 或 `accept-edits` |
 | `sandbox` | `true` | `--sandbox`，开启终端限制 |
 | `skip_permissions` | `true` | 自动批准工具调用（headless 无法弹审批框，关掉就连文件都读不到） |
@@ -323,6 +327,10 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `AGY_MCP_PROGRESS_INTERVAL_MS` | `400` | 进度通知最小间隔（`0` = 不节流） |
 | `AGY_MCP_MAX_PROMPT_CHARS` | `100000` | prompt 软上限；超了会提示改用 `files` 或让 agent 自己读 |
 | `AGY_MCP_MAX_DIFF_CHARS` | `60000` | `diff: true` 时附上的 diff 上限，超出截断并注明 |
+| `AGY_MCP_DEFAULT_MODEL` | `gemini-3.8-flash-high` | 不传 `model` 时用的模型（设为空则交给 CLI 自己的默认值） |
+| `AGY_MCP_MODEL_PREFERENCE` | gemini 3.8 flash high → 3.1 pro high → claude sonnet 4.6 → claude opus 4.6 → gpt-oss | `model: "auto"` 的挑选顺序 |
+| `AGY_MCP_QUOTA_WARN_PERCENT` | `10` | 5 小时 / 周余量低于该百分比时提示一次（`0` = 关闭） |
+| `AGY_MCP_QUOTA_REFRESH_SEC` | `300` | 后台刷新配额与提示冷却的间隔 |
 | `AGY_MCP_MAX_PARALLEL` | `1` | `>1` 时锁按会话粒度，允许多个不同会话并行（值为并发上限） |
 | `AGY_MCP_PREWARM` | `0` | 设 `1` 时服务器启动即拉起默认会话进程，第一次提问不必等冷启动 |
 | `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
@@ -338,6 +346,21 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `~/.agy-mcp/call.lock` | 跨进程单飞锁 |
 | `~/.agy-mcp/workers.json` | 当前会话进程的 pid；服务器被强杀后，下次启动据此清理遗留进程 |
 | `~/.gemini/antigravity-cli/` | `agy` 自身状态：会话库、缓存与日志 |
+
+## 常用配方
+
+| 场景 | 怎么调 |
+| --- | --- |
+| 评审改动 | `diff: true` + `prompt="逐条评审这些改动，按 file:line 给结论，指出风险与遗漏"` |
+| 只出方案不改代码 | `mode: "plan"` + 说明"只给方案，不要改文件" |
+| 省钱跑日常 | 不传 `model`（默认 `gemini-3.8-flash-high`），或用 `effort: "low"` 压思考预算 |
+| 难题上强模型 | `model: "claude-opus-4-6-thinking"`（或 `gemini-3.1-pro-high`） |
+| 不知道额度够不够 | `model: "auto"`：按 `antigravity_quota` 的组余量挑一个还有空间的模型，并在回答里说明选了什么 |
+| 让它读指定文件 | `files: ["/abs/a.py", "/abs/b.md"]`，比把内容粘进 prompt 省 token |
+| 换话题 / 压缩上下文 | 换 `session` 名；或用 `handoff: true` 压成交接摘要后开新会话 |
+
+额度快用完时（5 小时或周余量低于 `AGY_MCP_QUOTA_WARN_PERCENT`，默认 10%）会在回答后附一句提示，
+只提示不拦截；配 `model: "auto"` 就能自动绕到还有余量的那一组。
 
 ## 多账号 / 多实例
 
@@ -373,6 +396,8 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 | 达到每日上限（`Daily Antigravity cap reached`） | 等次日，或调 `AGY_MCP_MAX_CALLS_PER_DAY` |
 | 回答不是干净正文 | 传 `output_format: "json"` 看 CLI 原始返回 |
 | macOS 上找不到 `agy` | `which agy`，或 `export AGY_BIN=...`；脚本按 `AGY_BIN` → `PATH` → `~/.local/bin/agy` 顺序探测 |
+| 自己写脚本一次性喂完请求后没有回答 | 管道关闭时，仍在跑的轮次会在 `AGY_MCP_SHUTDOWN_GRACE_SEC`（默认 10s）后被取消；保持 stdin 打开直到收到响应 |
+| 回答后多一句 `quota is nearly used up` | 5 小时/周余量低于阈值，只是提示；换 `model: "auto"` 或降低用量 |
 
 ## 已知边界
 
@@ -385,7 +410,7 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 24 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 27 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
@@ -393,6 +418,8 @@ python3 test_agy_mcp.py     # 24 项离线测试：不需要网络、账号或 a
 进度通知（含文字片段）、自动 handoff、`--self-test`、默认权限、`files`、prompt 护栏、结构化 models、
 会话 token 累计、只读工具不排队、孤儿进程回收（含"不误杀无关进程"）。
 本地 diff 抓取（含非 git 仓库的降级路径）也在其中。
+`tests/fixtures/stream_turn.ndjson` 是录下来的**真实** stream 转写（已脱敏），用来防协议漂移：
+改解析器时不用装 agy 也能发现回归。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

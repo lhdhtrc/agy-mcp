@@ -28,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.4"
+SERVER_VERSION = "0.1.5"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -67,6 +67,13 @@ DEFAULT_USAGE_ROTATE_MB = 5.0
 DEFAULT_PROGRESS_INTERVAL_MS = 400
 DEFAULT_MAX_PROMPT_CHARS = 100000
 DEFAULT_MAX_DIFF_CHARS = 60000
+DEFAULT_MODEL = "gemini-3.8-flash-high"
+DEFAULT_MODEL_PREFERENCE = (
+    "gemini-3.8-flash-high,gemini-3.1-pro-high,claude-sonnet-4-6,"
+    "claude-opus-4-6-thinking,gpt-oss-120b-medium"
+)
+DEFAULT_QUOTA_WARN_PERCENT = 10.0
+DEFAULT_QUOTA_REFRESH_SEC = 300.0
 HANDOFF_PROMPT = (
     "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
     "Requirements:\n"
@@ -742,11 +749,8 @@ class Worker:
                 continue
             if tag.endswith("-eof") or not line:
                 continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
+            event = parse_stream_line(line)
+            if event is None:
                 continue
             if on_event is not None:
                 try:
@@ -765,13 +769,8 @@ class Worker:
                     return result
             elif on_progress is not None and event.get("event") != "init":
                 steps += 1
-                update = event.get("step_update")
-                update = update if isinstance(update, dict) else {}
-                step_type = str(update.get("step_type") or event.get("step_type") or "step")
-                state = str(update.get("state") or "")
-                label = f"{step_type} {state}".strip()
-                delta = update.get("text_delta")
-                detail = summarize_delta(delta) if isinstance(delta, str) else None
+                parsed = progress_from_event(event)
+                label, detail = parsed if parsed else ("step", None)
                 try:
                     on_progress(steps, label, detail)
                 except Exception as exc:  # noqa: BLE001 - progress must never break a turn
@@ -807,6 +806,14 @@ MAX_PROMPT_CHARS = _env_int("AGY_MCP_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS
 MAX_DIFF_CHARS = _env_int("AGY_MCP_MAX_DIFF_CHARS", DEFAULT_MAX_DIFF_CHARS)
 MAX_PARALLEL = max(1, _env_int("AGY_MCP_MAX_PARALLEL", 1))
 PREWARM = _env_int("AGY_MCP_PREWARM", 0) != 0
+MODEL_PREFERENCE = [
+    item.strip()
+    for item in (os.environ.get("AGY_MCP_MODEL_PREFERENCE") or DEFAULT_MODEL_PREFERENCE).split(",")
+    if item.strip()
+]
+DEFAULT_MODEL_ID = os.environ.get("AGY_MCP_DEFAULT_MODEL", DEFAULT_MODEL)
+QUOTA_WARN_PERCENT = _env_float("AGY_MCP_QUOTA_WARN_PERCENT", DEFAULT_QUOTA_WARN_PERCENT)
+QUOTA_REFRESH_SEC = _env_float("AGY_MCP_QUOTA_REFRESH_SEC", DEFAULT_QUOTA_REFRESH_SEC)
 
 
 def reap_workers() -> None:
@@ -995,6 +1002,31 @@ def summarize_delta(text: str, limit: int = 120) -> str:
     return "…" + collapsed[-limit:]
 
 
+def parse_stream_line(line: str) -> Optional[Dict[str, Any]]:
+    """Parse one NDJSON line of the CLI's stream into an event dict (or None)."""
+    text = line.strip()
+    if not text:
+        return None
+    try:
+        event = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def progress_from_event(event: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+    """(label, text preview) for a step event; None when the event is not a step."""
+    if event.get("event") == "init":
+        return None
+    update = event.get("step_update")
+    update = update if isinstance(update, dict) else {}
+    step_type = str(update.get("step_type") or event.get("step_type") or "step")
+    state = str(update.get("state") or "")
+    label = f"{step_type} {state}".strip()
+    delta = update.get("text_delta")
+    return label, (summarize_delta(delta) if isinstance(delta, str) else None)
+
+
 def notify_progress(
     progress: float,
     message: str,
@@ -1146,7 +1178,13 @@ ASK_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": "Git ref to diff against when `diff` is used (default: HEAD).",
         },
-        "model": {"type": "string", "description": "Optional Antigravity model id."},
+        "model": {
+            "type": "string",
+            "description": (
+                "Antigravity model id (see antigravity_models), or 'auto' to pick one whose "
+                f"quota group still has room. Default: {DEFAULT_MODEL}."
+            ),
+        },
         "effort": {
             "type": "string",
             "enum": ["low", "medium", "high"],
@@ -1314,6 +1352,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
             True,
         )
     prompt = attach_files(prompt, args.get("files"))
+    args["model"], model_notes = resolve_model(args.get("model"))
 
     workspace = os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd())
     if not os.path.isdir(workspace):
@@ -1330,6 +1369,11 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     entry = entry if isinstance(entry, dict) else {}
     notes: List[str] = []
     resumed = False
+    notes.extend(model_notes)
+    warning = quota_warning()
+    if warning:
+        notes.append(warning)
+    refresh_quota_in_background()
 
     if args.get("diff") or args.get("diff_base"):
         diff_text, diff_note = collect_diff(workspace, args.get("diff_base"), MAX_DIFF_CHARS)
@@ -1740,6 +1784,19 @@ def tool_quota(args: Dict[str, Any]) -> Dict[str, Any]:
     except FileNotFoundError as exc:
         return text_result(str(exc), True)
 
+    groups = summarize_quota(payload)
+    report = {
+        "table": (payload.get("response") or "").strip(),
+        "groups": groups,
+        "cached_for_sec": QUOTA_CACHE_TTL,
+        "note": "answered by the CLI itself; no turn ran and no quota was spent",
+    }
+    ok = bool(groups) or bool(report["table"])
+    return text_result(json.dumps(report, ensure_ascii=False, indent=2), not ok)
+
+
+def summarize_quota(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten the CLI's quota report into [{group, buckets:[{id,name,remaining_percent}]}]."""
     command = payload.get("command")
     groups: List[Dict[str, Any]] = []
     if isinstance(command, dict):
@@ -1764,15 +1821,101 @@ def tool_quota(args: Dict[str, Any]) -> Dict[str, Any]:
                         }
                     )
                 groups.append({"group": group.get("name"), "buckets": buckets})
+    return groups
 
-    report = {
-        "table": (payload.get("response") or "").strip(),
-        "groups": groups,
-        "cached_for_sec": QUOTA_CACHE_TTL,
-        "note": "answered by the CLI itself; no turn ran and no quota was spent",
-    }
-    ok = bool(groups) or bool(report["table"])
-    return text_result(json.dumps(report, ensure_ascii=False, indent=2), not ok)
+
+def quota_headroom() -> Dict[str, float]:
+    """Per model group: how much of the tighter window (5h / weekly) is left, in percent."""
+    payload = QUOTA_CACHE.get("payload")
+    headroom: Dict[str, float] = {}
+    if not payload:
+        return headroom
+    for group in summarize_quota(payload):
+        values = [
+            bucket["remaining_percent"]
+            for bucket in group.get("buckets", [])
+            if isinstance(bucket.get("remaining_percent"), (int, float))
+        ]
+        if values:
+            headroom[str(group.get("group"))] = min(values)
+    return headroom
+
+
+def refresh_quota_in_background() -> None:
+    """Keep the quota cache warm off the critical path so warnings never add latency."""
+    age = time.time() - float(QUOTA_CACHE.get("ts") or 0)
+    if QUOTA_CACHE.get("payload") and age < QUOTA_REFRESH_SEC:
+        return
+    if _QUOTA_REFRESHING.is_set():
+        return
+
+    def run() -> None:
+        _QUOTA_REFRESHING.set()
+        try:
+            read_quota()
+        except Exception as exc:  # noqa: BLE001 - a background refresh must stay quiet
+            log(f"background quota refresh failed: {exc!r}")
+        finally:
+            _QUOTA_REFRESHING.clear()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+_QUOTA_REFRESHING = threading.Event()
+_QUOTA_WARNED_AT = 0.0
+
+
+def quota_warning() -> Optional[str]:
+    """Warn (once in a while) when a group's 5-hour or weekly window is nearly used up."""
+    global _QUOTA_WARNED_AT
+    if QUOTA_WARN_PERCENT <= 0:
+        return None
+    headroom = quota_headroom()
+    if not headroom:
+        return None
+    low = {group: left for group, left in headroom.items() if left <= QUOTA_WARN_PERCENT}
+    if not low:
+        return None
+    if time.time() - _QUOTA_WARNED_AT < QUOTA_REFRESH_SEC:
+        return None
+    _QUOTA_WARNED_AT = time.time()
+    detail = ", ".join(f"{group} {left:.0f}%" for group, left in sorted(low.items()))
+    return f"quota is nearly used up (5-hour or weekly window): {detail}"
+
+
+def model_group(model_id: str) -> str:
+    """Which quota group a model id belongs to."""
+    lowered = model_id.lower()
+    if lowered.startswith("claude") or "gpt" in lowered:
+        return "Claude and GPT models"
+    return "Gemini Models"
+
+
+def resolve_model(requested: Any) -> Tuple[Optional[str], List[str]]:
+    """Resolve the `model` argument: a concrete id, `auto` (quota aware), or the default."""
+    requested_text = str(requested).strip() if requested else ""
+    if not requested_text:
+        return (DEFAULT_MODEL_ID or None), []
+    if requested_text.lower() != "auto":
+        return requested_text, []
+
+    available = [model["id"] for model in parse_models(cached_models()[1])]
+    if not available:
+        return (DEFAULT_MODEL_ID or None), ["auto: could not list models, used the default"]
+    headroom = quota_headroom()
+    candidates = [model for model in MODEL_PREFERENCE if model in available] or available
+
+    def left(model_id: str) -> float:
+        return headroom.get(model_group(model_id), 100.0)
+
+    roomy = [model for model in candidates if left(model) > QUOTA_WARN_PERCENT]
+    chosen = roomy[0] if roomy else max(candidates, key=left)
+    reason = f"auto: {chosen}"
+    if headroom:
+        reason += f" (headroom {left(chosen):.0f}% in {model_group(chosen)})"
+    else:
+        reason += " (quota unknown)"
+    return chosen, [reason]
 
 
 def tool_status(args: Dict[str, Any]) -> Dict[str, Any]:

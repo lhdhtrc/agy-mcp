@@ -575,6 +575,104 @@ def test_diff_on_a_non_repo_is_reported_not_fatal() -> None:
             assert any("not a git working tree" in note for note in notes), notes
 
 
+def _quota_payload(gemini_percent: float, third_party_percent: float) -> dict:
+    return {
+        "command": {
+            "data": {
+                "groups": [
+                    {
+                        "name": "Gemini Models",
+                        "buckets": [
+                            {"id": "gemini-5h", "name": "5h", "remaining_fraction": gemini_percent / 100},
+                            {"id": "gemini-weekly", "name": "weekly", "remaining_fraction": 1.0},
+                        ],
+                    },
+                    {
+                        "name": "Claude and GPT models",
+                        "buckets": [
+                            {
+                                "id": "3p-5h",
+                                "name": "5h",
+                                "remaining_fraction": third_party_percent / 100,
+                            }
+                        ],
+                    },
+                ]
+            }
+        }
+    }
+
+
+def test_stream_fixture_still_parses() -> None:
+    """Regression guard against CLI protocol drift: a recorded real stream must stay parsable."""
+    fixture = os.path.join(HERE, "tests", "fixtures", "stream_turn.ndjson")
+    with open(fixture, encoding="utf-8") as handle:
+        events = [agy_mcp.parse_stream_line(line) for line in handle]
+    events = [event for event in events if event is not None]
+    assert len(events) >= 4, events
+
+    kinds = [event.get("event") for event in events]
+    assert kinds[0] == "init" and kinds[-1] == "result", kinds
+    assert "step_update" in kinds, kinds
+
+    init = events[0]
+    assert init.get("conversation_id"), init
+    steps = [event["step_update"] for event in events if isinstance(event.get("step_update"), dict)]
+    assert all(step.get("step_type") for step in steps), steps
+    assert any(step.get("state") == "ACTIVE" for step in steps), steps
+
+    result = events[-1]["result"]
+    for key in ("conversation_id", "status", "response", "usage"):
+        assert key in result, (key, result)
+    assert result["status"] == "SUCCESS"
+    assert agy_mcp.extract_answer(result) == "OK"
+
+    # the same helpers the live worker uses must derive progress from the fixture
+    active = next(event for event in events if event.get("step_update", {}).get("state") == "ACTIVE")
+    label, detail = agy_mcp.progress_from_event(active)
+    assert "agent_response" in label, label
+    assert detail == "OK", detail
+    assert agy_mcp.progress_from_event(init) is None
+
+
+def test_model_defaults_and_auto_selection() -> None:
+    assert agy_mcp.resolve_model(None) == (agy_mcp.DEFAULT_MODEL_ID, [])
+    assert agy_mcp.resolve_model("claude-sonnet-4-6") == ("claude-sonnet-4-6", [])
+
+    models = "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6"
+    original_models, original_quota = agy_mcp.cached_models, agy_mcp.read_quota
+    agy_mcp.cached_models = lambda: (0, models)
+    try:
+        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 5)})
+        chosen, notes = agy_mcp.resolve_model("auto")
+        assert chosen == "gemini-3.8-flash-high", (chosen, notes)
+        assert any("headroom 90%" in note for note in notes), notes
+
+        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(2, 80)})
+        chosen, notes = agy_mcp.resolve_model("auto")
+        assert chosen == "claude-sonnet-4-6", (chosen, notes)
+    finally:
+        agy_mcp.cached_models, agy_mcp.read_quota = original_models, original_quota
+        agy_mcp.QUOTA_CACHE.update({"ts": 0.0, "payload": None})
+
+
+def test_quota_warning_is_warn_only_and_cooldown_limited() -> None:
+    original = dict(agy_mcp.QUOTA_CACHE)
+    try:
+        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 90)})
+        agy_mcp._QUOTA_WARNED_AT = 0.0
+        assert agy_mcp.quota_warning() is None
+
+        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(4, 90)})
+        warning = agy_mcp.quota_warning()
+        assert warning and "Gemini Models" in warning, warning
+        # cooldown: the same state must not nag on every call
+        assert agy_mcp.quota_warning() is None
+    finally:
+        agy_mcp.QUOTA_CACHE.update(original)
+        agy_mcp._QUOTA_WARNED_AT = 0.0
+
+
 def test_orphan_reaping_never_kills_unrelated_processes() -> None:
     sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
     try:
@@ -650,6 +748,9 @@ TESTS = (
     test_orphaned_workers_are_reaped,
     test_diff_is_captured_locally_and_attached,
     test_diff_on_a_non_repo_is_reported_not_fatal,
+    test_model_defaults_and_auto_selection,
+    test_stream_fixture_still_parses,
+    test_quota_warning_is_warn_only_and_cooldown_limited,
     test_orphan_reaping_never_kills_unrelated_processes,
     test_read_only_tools_do_not_queue_behind_a_turn,
 )
