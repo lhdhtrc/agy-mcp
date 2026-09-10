@@ -160,6 +160,10 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 注意：续接会把该会话历史一起发给模型，**input token 随轮次增长**（一次实测中第二轮 input 从 14k 涨到 28k），
 长会话既费额度也费时间。
 
+**取消**：客户端中断一次调用（Codex 里按 Esc）会发 `notifications/cancelled`，服务器收到就立刻结束那一轮所对应的
+`agy` 会话进程，不再继续烧额度，也不再回一条没人要的响应；下次调用会自动接着同一会话继续。
+工具调用在服务器内保持先进先出，所以不会出现两轮抢同一个会话。
+
 ## 切换会话与 handoff
 
 人工切换：让客户端带不同的 `session` 名调用即可（`session: "review"` / `session: "writing"`）；
@@ -257,6 +261,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `AGY_MCP_QUOTA_CACHE_SEC` | `60` | 额度结果缓存时长 |
 | `AGY_MCP_MODELS_CACHE_SEC` | `300` | `antigravity_status` 里模型列表的缓存时长 |
 | `AGY_MCP_HANDOFF_PROMPT` | 内置提示词 | 覆盖 handoff 摘要提示词（内置版要求"用与原对话相同的语言"输出） |
+| `AGY_MCP_SHUTDOWN_GRACE_SEC` | `10` | 客户端关闭连接后，等待在跑的工具调用收尾的秒数（超时则中止） |
 | `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
 | `AGY_CLI_HOME` | `~/.gemini/antigravity-cli` | CLI 自身状态目录（一般不用改） |
 
@@ -296,10 +301,11 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 10 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 11 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
+覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

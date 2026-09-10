@@ -59,6 +59,7 @@ DEFAULT_WORKER_IDLE_SEC = 900.0
 INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
 DEFAULT_ADOPT_WINDOW_SEC = 120.0
 DEFAULT_LONG_CONTEXT_TOKENS = 100000
+DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
 HANDOFF_PROMPT = (
     "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
     "Requirements:\n"
@@ -515,6 +516,7 @@ class Worker:
         self.conversation_id: Optional[str] = None
         self.last_used = time.time()
         self.turns = 0
+        self.busy = False
 
     def start(self) -> None:
         command = agy_command_prefix()
@@ -552,6 +554,14 @@ class Worker:
     def send(self, prompt: str, timeout: float) -> Dict[str, Any]:
         if not self.alive() or self.proc is None or self.proc.stdin is None:
             raise RuntimeError("agy stream process is not running")
+        self.busy = True
+        try:
+            return self._send_locked(prompt, timeout)
+        finally:
+            self.busy = False
+
+    def _send_locked(self, prompt: str, timeout: float) -> Dict[str, Any]:
+        assert self.proc is not None and self.proc.stdin is not None
 
         while not self.events.empty():  # drop anything left over from a previous turn
             try:
@@ -620,12 +630,15 @@ WORKERS: Dict[str, Worker] = {}
 WORKER_IDLE_SEC = _env_float("AGY_MCP_WORKER_IDLE_SEC", DEFAULT_WORKER_IDLE_SEC)
 ADOPT_WINDOW_SEC = _env_float("AGY_MCP_INSTANCE_WINDOW_SEC", DEFAULT_ADOPT_WINDOW_SEC)
 LONG_CONTEXT_TOKENS = _env_int("AGY_MCP_LONG_CONTEXT_TOKENS", DEFAULT_LONG_CONTEXT_TOKENS)
+SHUTDOWN_GRACE_SEC = _env_float("AGY_MCP_SHUTDOWN_GRACE_SEC", DEFAULT_SHUTDOWN_GRACE_SEC)
 
 
 def reap_workers() -> None:
     now = time.time()
     for key in list(WORKERS):
         worker = WORKERS[key]
+        if worker.busy:
+            continue  # a long turn must not be reaped from under itself
         idle = WORKER_IDLE_SEC > 0 and now - worker.last_used > WORKER_IDLE_SEC
         if not worker.alive() or idle:
             worker.stop()
@@ -661,6 +674,61 @@ def _install_signal_handlers() -> None:
             signal.signal(sig, handler)
         except (AttributeError, OSError, ValueError):
             pass
+
+
+class ActiveTask:
+    """A tool call running off the main loop, so cancellations can reach it."""
+
+    def __init__(self, request_id: Any) -> None:
+        self.request_id = request_id
+        self.cancelled = threading.Event()
+        self.suppress_response = False
+        self.worker: Optional["Worker"] = None
+
+    def bind(self, worker: Optional["Worker"]) -> None:
+        self.worker = worker
+        if worker is not None and self.cancelled.is_set():
+            worker.stop()  # cancelled while this call was still starting up
+
+
+ACTIVE_TASKS: Dict[Any, ActiveTask] = {}
+TASKS_LOCK = threading.Lock()
+SEND_LOCK = threading.Lock()
+TOOL_QUEUE: "queue.Queue[Tuple[Dict[str, Any], ActiveTask]]" = queue.Queue()
+_TASK_LOCAL = threading.local()
+
+
+def current_task() -> Optional[ActiveTask]:
+    return getattr(_TASK_LOCAL, "task", None)
+
+
+def is_cancelled() -> bool:
+    task = current_task()
+    return task is not None and task.cancelled.is_set()
+
+
+def register_task(task: ActiveTask) -> None:
+    with TASKS_LOCK:
+        ACTIVE_TASKS[task.request_id] = task
+
+
+def finish_task(request_id: Any) -> None:
+    with TASKS_LOCK:
+        ACTIVE_TASKS.pop(request_id, None)
+
+
+def cancel_task(request_id: Any) -> bool:
+    """Stop the turn behind `request_id`: the client no longer waits, so neither should we."""
+    with TASKS_LOCK:
+        task = ACTIVE_TASKS.get(request_id)
+    if task is None:
+        return False
+    task.suppress_response = True
+    task.cancelled.set()
+    log(f"cancel {request_id!r}: stopping the Antigravity turn")
+    if task.worker is not None:
+        task.worker.stop()
+    return True
 
 
 atexit.register(shutdown_workers)
@@ -848,6 +916,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     prompt = args.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return text_result("antigravity_ask requires a non-empty 'prompt' string.", True)
+    if is_cancelled():
+        return text_result("Antigravity turn cancelled before it started.", True)
 
     workspace = os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd())
     if not os.path.isdir(workspace):
@@ -973,6 +1043,11 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                         "started a long-lived Antigravity session process; later calls reuse it "
                         "(set AGY_MCP_TRANSPORT=oneshot to force one process per call)"
                     )
+                task = current_task()
+                if task is not None:
+                    task.bind(worker)
+                if is_cancelled():
+                    return text_result("Antigravity turn cancelled.", True)
                 payload = worker.send(seed_prompt(prompt, digest), timeout_sec + TIMEOUT_GRACE_SEC)
             else:
                 digest = None
@@ -992,6 +1067,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     if digest:
                         notes.append("handoff: carried a digest of the previous conversation into a new one")
                 send_flags = session_flags(args, None, False) if handoff else flags
+                if is_cancelled():
+                    return text_result("Antigravity turn cancelled.", True)
                 argv = ["-p", seed_prompt(prompt, digest)] + send_flags
                 argv += ["--print-timeout", f"{int(timeout_sec)}s", "--output-format", "json"]
                 code, out, err = run_agy(argv, cwd=workspace, timeout=timeout_sec + TIMEOUT_GRACE_SEC)
@@ -1383,6 +1460,10 @@ def handle_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         }
     if method in ("notifications/initialized", "initialized"):
         return None
+    if method in ("notifications/cancelled", "cancelled"):
+        params = message.get("params") or {}
+        cancel_task(params.get("requestId"))
+        return None
     if method == "ping":
         return {}
     if method == "tools/list":
@@ -1423,10 +1504,53 @@ def send(payload: Dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
+def _run_tool_call(message: Dict[str, Any], task: ActiveTask) -> None:
+    """Run one tool call in its own thread; the main loop keeps reading for cancellations."""
+    _TASK_LOCAL.task = task
+    error: Optional[Dict[str, Any]] = None
+    result: Optional[Dict[str, Any]] = None
+    try:
+        result = handle_request(message)
+    except Exception as exc:  # noqa: BLE001 - a bad call must not kill the server
+        log(f"tool call failed: {exc!r}")
+        error = {"code": -32603, "message": f"Internal error: {exc}"}
+    finally:
+        finish_task(task.request_id)
+        _TASK_LOCAL.task = None
+
+    if task.suppress_response or task.cancelled.is_set():
+        log(f"dropped the response for cancelled request {task.request_id!r}")
+        return
+    with SEND_LOCK:
+        if error is not None:
+            send({"jsonrpc": "2.0", "id": task.request_id, "error": error})
+        elif result is None:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": task.request_id,
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            )
+        else:
+            send({"jsonrpc": "2.0", "id": task.request_id, "result": result})
+
+
+def _tool_call_loop() -> None:
+    """Single consumer: tool calls stay FIFO, while the main loop keeps reading for cancels."""
+    while True:
+        message, task = TOOL_QUEUE.get()
+        try:
+            _run_tool_call(message, task)
+        except Exception as exc:  # noqa: BLE001 - keep serving whatever happens
+            log(f"tool call loop error: {exc!r}")
+
+
 def serve() -> int:
     log(f"serving {SERVER_NAME} {SERVER_VERSION}")
     _install_signal_handlers()
     threading.Thread(target=_reaper_loop, daemon=True).start()
+    threading.Thread(target=_tool_call_loop, daemon=True).start()
     while True:
         raw = sys.stdin.buffer.readline()
         if not raw:
@@ -1442,32 +1566,58 @@ def serve() -> int:
         if not isinstance(message, dict):
             continue
 
+        # Tool calls can block for minutes; run them off the loop so a
+        # `notifications/cancelled` arriving meanwhile can stop the turn.
+        if message.get("method") == "tools/call" and message.get("id") is not None:
+            task = ActiveTask(message["id"])
+            register_task(task)
+            TOOL_QUEUE.put((message, task))
+            continue
+
         try:
             result = handle_request(message)
         except Exception as exc:
             log(f"handler error: {exc!r}")
             if message.get("id") is not None:
-                send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": message.get("id"),
-                        "error": {"code": -32603, "message": f"Internal error: {exc}"},
-                    }
-                )
+                with SEND_LOCK:
+                    send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": message.get("id"),
+                            "error": {"code": -32603, "message": f"Internal error: {exc}"},
+                        }
+                    )
             continue
 
         if message.get("id") is None:
             continue
-        if result is None:
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": message.get("id"),
-                    "error": {"code": -32601, "message": f"Method not found: {message.get('method')}"},
-                }
-            )
-        else:
-            send({"jsonrpc": "2.0", "id": message.get("id"), "result": result})
+        with SEND_LOCK:
+            if result is None:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message.get("id"),
+                        "error": {
+                            "code": -32601,
+                            "message": f"Method not found: {message.get('method')}",
+                        },
+                    }
+                )
+            else:
+                send({"jsonrpc": "2.0", "id": message.get("id"), "result": result})
+
+    # stdin closed: let quick in-flight calls flush their answer, then stop the rest.
+    deadline = time.monotonic() + SHUTDOWN_GRACE_SEC
+    while time.monotonic() < deadline:
+        with TASKS_LOCK:
+            if not ACTIVE_TASKS:
+                break
+        time.sleep(0.1)
+    with TASKS_LOCK:
+        pending = list(ACTIVE_TASKS)
+    for request_id in pending:
+        cancel_task(request_id)
+    shutdown_workers()
     return 0
 
 

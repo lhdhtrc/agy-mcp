@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = tempfile.mkdtemp(prefix="agy-mcp-test-")
@@ -27,7 +28,7 @@ import agy_mcp  # noqa: E402  (import after the state dir is set)
 # the stream transport used by the resident session process. Lets the whole turn protocol be
 # tested offline, with no network, no account and no `agy` installed.
 FAKE_AGY = r'''
-import json, sys, uuid
+import json, sys, time, uuid
 
 # The server speaks UTF-8 on the pipes; do not let the fixture's locale decode it differently.
 sys.stdin.reconfigure(encoding="utf-8", errors="replace")
@@ -60,6 +61,8 @@ if "stream-json" in argv and "--input-format" in argv:
             continue
         content = str((message.get("message") or {}).get("content", ""))
         turns += 1
+        if content.startswith("slow:"):
+            time.sleep(60)  # stands in for a long agent turn; a cancel must kill it
         emit({"event": "result", "result": {
             "conversation_id": conversation,
             "status": "SUCCESS",
@@ -300,6 +303,67 @@ def test_handoff_starts_a_new_conversation_with_the_digest() -> None:
         assert answer.endswith("what was the token?"), answer
 
 
+def test_cancelled_turn_is_dropped_and_frees_the_session() -> None:
+    """Esc in the client sends notifications/cancelled; that must stop the turn, not just be ignored."""
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-cancel-") as state:
+        env = {
+            **os.environ,
+            "AGY_MCP_STATE_DIR": state,
+            "AGY_MCP_MIN_INTERVAL_SEC": "0",
+            "AGY_MCP_TRANSPORT": "stream",
+            "AGY_MCP_AGY_CMD": f'"{sys.executable}" "{_fake_cli()}"',
+        }
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(HERE, "agy_mcp.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=HERE,
+            env=env,
+            bufsize=1,
+        )
+
+        def write(payload: dict) -> None:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+
+        try:
+            write({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})
+            write(ask(1, "slow: think for a while", session="cancel-check", timeout_sec=120))
+            time.sleep(1.5)
+            started = time.time()
+            write({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 1, "reason": "user"},
+            })
+            write(ask(2, "quick", session="cancel-check", timeout_sec=60))
+            assert proc.stdin is not None
+            proc.stdin.close()
+            out, _ = proc.communicate(timeout=90)
+            elapsed = time.time() - started
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+        responses = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                payload = json.loads(line)
+                if "id" in payload:
+                    responses[payload["id"]] = payload
+
+        assert 1 not in responses, f"a cancelled request must not answer: {responses.get(1)}"
+        assert responses[2]["result"]["content"][0]["text"] == "echo: quick"
+        assert elapsed < 30, f"cancel did not interrupt the slow turn ({elapsed:.1f}s)"
+        assert proc.returncode == 0
+
+
 TESTS = (
     test_extract_answer,
     test_seed_prompt,
@@ -311,6 +375,7 @@ TESTS = (
     test_stream_transport_reuses_one_conversation,
     test_oneshot_transport_still_answers,
     test_handoff_starts_a_new_conversation_with_the_digest,
+    test_cancelled_turn_is_dropped_and_frees_the_session,
 )
 
 
