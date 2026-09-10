@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.6，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.1.7，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 >
 > 兼容性：目前只在 **Windows** 实机验证过（agy 1.2.0）。macOS / Linux 的代码路径已按平台写好、
 > 离线测试覆盖，但还没有实机跑过 `--self-test`；跑通后欢迎反馈。
@@ -379,49 +379,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 
 ## 复用 Codex 的工具（浏览器等）
 
-agy 自己装浏览器驱动会失败（它去的是 Playwright 已废弃的旧 CDN，404）。更干净的做法是**让它直接复用 Codex 的工具栈**——
-把 Codex 自带的 `node_repl` MCP 服务器（带 `chrome,iab` 浏览器后端）注册进 agy：
-
-```bash
-python3 register_agy_mcp.py --share-codex-tools
-```
-
-这条命令会自动从 `~/.codex/config.toml` 读出 Codex 启动 `node_repl` 的全部参数（命令、参数、环境变量）再注册给 agy，
-避免手抄；`--dry-run` 可以先看它要执行什么，`--remove` 会一并从 agy 里摘掉。
-
-实测（agy 1.2.0 + Codex 内置 node_repl）：
-
-```
-提示：Use the node_repl MCP tool (its js tool) to compute 123*456, then reply with just the number.
-回答：56088
-```
-
-要点：
-
-- 让 agy 上网时**不要传 `no_web`**；权限默认已放行，一般无需额外配置。
-- Codex 的安装路径里带构建哈希（`...\Codex\bin\<hash>\node_repl.exe`），**Codex 升级后要重跑一次** `--share-codex-tools`。
-- 这是把 agy 的能力挂在 Codex 的私有组件上：能用，但属于非承诺接口，未来可能失效；真失效就退回修 Playwright
-  （`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.playwright.dev/dbazure/download/playwright`）。
-
-**总的原则**：让 agy 尽可能复用 Codex 的能力（工具、浏览器、以后的插件），只有"推理"用它自己的模型。
-
-想同时挂两个 Antigravity 账号（或个人 + 团队），给每个账号注册一个独立条目即可——
-服务器状态、会话与用量都按 `AGY_MCP_STATE_DIR` 隔离，CLI 凭据按 `AGY_CLI_HOME` 隔离：
-
-```toml
-[mcp_servers.antigravity-work]
-type = "stdio"
-command = "python3"
-args = ["/Users/you/agy-mcp/agy_mcp.py"]
-
-[mcp_servers.antigravity-work.env]
-AGY_CLI_HOME = "/Users/you/.gemini/antigravity-cli-work"
-AGY_MCP_STATE_DIR = "/Users/you/.agy-mcp-work"
-HTTP_PROXY = "http://127.0.0.1:7890"
-HTTPS_PROXY = "http://127.0.0.1:7890"
-```
-
-如果两个账号需要不同的 CLI 二进制或包装脚本，再用 `AGY_MCP_AGY_CMD` 指过去即可。
+见 [docs/codex-tools.md](docs/codex-tools.md)：为什么（Playwright 旧 CDN 404）、一条命令共享 Codex 的工具、实测结果与注意事项。
 
 ## 排障与已知边界
 
