@@ -8,6 +8,9 @@
 >
 > 兼容性：目前只在 **Windows** 实机验证过（agy 1.2.0）。macOS / Linux 的代码路径已按平台写好、
 > 离线测试覆盖，但还没有实机跑过 `--self-test`；跑通后欢迎反馈。
+>
+> 详细文档见 [docs/](docs/README.md)：[复用 Codex 的工具（含浏览器）](docs/codex-tools.md)、
+> [排障与兼容性](docs/troubleshooting.md)。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
@@ -420,31 +423,9 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 
 如果两个账号需要不同的 CLI 二进制或包装脚本，再用 `AGY_MCP_AGY_CMD` 指过去即可。
 
-## 排障
+## 排障与已知边界
 
-| 现象 | 处理 |
-| --- | --- |
-| `dial tcp 172.217.x.x:443 ... failed to respond`，或 `Please sign in` | 没设代理。用 `--proxy` 重跑注册脚本 |
-| 调用卡住几分钟无输出 | 同上，多半在等 Google 超时 |
-| 空回答 / `denied_actions` | 沙箱拒绝了它需要的工具。看提示里的权限名，需要就传 `skip_permissions: true`，或在 CLI 的 `settings.json` 加 allow 规则 |
-| 客户端里看不到 `antigravity_*` 工具 | 客户端不热加载 MCP，新开会话；确认配置里的 `[mcp_servers.antigravity]` 还在 |
-| 换了目录后对话"失忆" | 会话按 workspace 绑定，换目录会新开；跨目录续接请显式传 `conversation` |
-| 第一次调用明显比后面慢 | 正常：首次要冷启动会话进程（约 7 秒），之后热轮通常 1~2 秒 |
-| 上下文越来越慢、越来越贵 | 续接会重发全部历史；用 `handoff: true` 压缩后开新会话，或 `new_session: true` 直接重开 |
-| 达到每日上限（`Daily Antigravity cap reached`） | 等次日，或调 `AGY_MCP_MAX_CALLS_PER_DAY` |
-| 回答不是干净正文 | 传 `output_format: "json"` 看 CLI 原始返回 |
-| macOS 上找不到 `agy` | `which agy`，或 `export AGY_BIN=...`；脚本按 `AGY_BIN` → `PATH` → `~/.local/bin/agy` 顺序探测 |
-| 自己写脚本一次性喂完请求后没有回答 | 管道关闭时，仍在跑的轮次会在 `AGY_MCP_SHUTDOWN_GRACE_SEC`（默认 10s）后被取消；保持 stdin 打开直到收到响应 |
-| 回答后多一句 `quota is nearly used up` | 5 小时/周余量低于阈值，只是提示；换 `model: "auto"` 或降低用量 |
-| 回答是空的 / 提示 `finished without any text` | 那一轮把预算花在工具调用上了（浏览、读文件），或上下文过大。把数据直接给进去（`files` / `diff`）、缩小问题范围、加大 `timeout_sec`，或 `new_session: true` |
-| 让它查"实时行情 / 今天的新闻"却给了看似精确的数字 | **别信**。agy 的浏览器工具在这台机器上装不起来（Playwright driver 下载 404），它拿不到实时数据，只会凭记忆编。这类数据先让 Codex 抓，再把结果交给它分析 |
-
-## 已知边界
-
-- MCP 工具只能被客户端**主动调用**，不能替代会话的默认模型，因此 Antigravity 不会出现在模型选择器里。
-- 一次调用 = 一整个 Antigravity 会话（含其自身的系统提示与工具），不适合当高频、低延迟的模型接口。
-- 会话历史会随续接一起发送，长会话的 input token 与耗时都会上升。
-- 这是用消费级订阅额度做程序化调用，是否可接受请自行判断；护栏只是让流量形状更接近正常 CLI 使用。
+见 [docs/troubleshooting.md](docs/troubleshooting.md)：症状 → 原因 → 处理，以及已知边界与兼容性矩阵。
 
 ## 开发
 

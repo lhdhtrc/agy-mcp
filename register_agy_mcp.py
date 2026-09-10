@@ -164,7 +164,7 @@ def read_existing_env(path: str) -> dict:
     return {str(key): str(value) for key, value in env.items()}
 
 
-def codex_tool_entry(codex_config: str) -> Optional[dict]:
+def codex_tool_entries(codex_config: str) -> dict:
     """Codex ships its own tool MCP servers (node_repl with browser backends).
 
     Reading them out of Codex's config lets agy reuse those tools instead of
@@ -174,36 +174,54 @@ def codex_tool_entry(codex_config: str) -> Optional[dict]:
         with open(codex_config, "rb") as handle:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
-        return None
+        return {}
     servers = data.get("mcp_servers")
-    entry = servers.get(CODEX_TOOLS_ID) if isinstance(servers, dict) else None
-    return entry if isinstance(entry, dict) else None
+    if not isinstance(servers, dict):
+        return {}
+    # Skip our own server: sharing it would let agy call agy-mcp and recurse.
+    return {
+        name: entry
+        for name, entry in servers.items()
+        if isinstance(entry, dict) and name != SERVER_ID
+    }
 
 
-def share_codex_tools(entry: Optional[dict], agy: Optional[str], remove: bool, dry_run: bool) -> str:
-    """Register (or drop) Codex's own tool server inside the Antigravity CLI."""
+def share_codex_tools(
+    entries: dict, chosen: List[str], agy: Optional[str], remove: bool, dry_run: bool
+) -> str:
+    """Register (or drop) Codex's own tool servers inside the Antigravity CLI."""
     if not agy:
         return "skipped (agy not found)"
-    if remove:
-        command = [agy, "mcp", "remove", CODEX_TOOLS_ID]
-    else:
-        if not entry:
-            return f"skipped (Codex has no {CODEX_TOOLS_ID} server in its config)"
-        command = [agy, "mcp", "add"]
-        for key, value in sorted((entry.get("env") or {}).items()):
-            command += ["--env", f"{key}={value}"]
-        command.append(CODEX_TOOLS_ID)
-        command.append(str(entry.get("command") or ""))
-        command += [str(arg) for arg in (entry.get("args") or [])]
-    if dry_run:
-        print("  would run: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-        return "dry-run"
-    try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=90)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"failed: {exc}"
-    text = (proc.stdout or "").strip() or (proc.stderr or "").strip()
-    return text or f"exit {proc.returncode}"
+    names = chosen or sorted(entries)
+    if not names:
+        return "skipped (Codex exposes no MCP servers in its config)"
+    done = []
+    for name in names:
+        if remove:
+            command = [agy, "mcp", "remove", name]
+        else:
+            entry = entries.get(name)
+            if not entry:
+                done.append(f"{name}: not in Codex config")
+                continue
+            command = [agy, "mcp", "add"]
+            for key, value in sorted((entry.get("env") or {}).items()):
+                command += ["--env", f"{key}={value}"]
+            command.append(name)
+            command.append(str(entry.get("command") or ""))
+            command += [str(arg) for arg in (entry.get("args") or [])]
+        if dry_run:
+            print("  would run: " + " ".join(f'"{part}"' if " " in part else part for part in command))
+            done.append(f"{name}: dry-run")
+            continue
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=90)
+        except (OSError, subprocess.SubprocessError) as exc:
+            done.append(f"{name}: failed ({exc})")
+            continue
+        text = (proc.stdout or "").strip() or (proc.stderr or "").strip() or f"exit {proc.returncode}"
+        done.append(f"{name}: {text}")
+    return "; ".join(done)
 
 
 def write_db(db_path: str, config: dict, remove: bool, dry_run: bool) -> str:
@@ -279,11 +297,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--share-codex-tools",
-        action="store_true",
+        nargs="*",
+        metavar="NAME",
         help=(
-            "Also register Codex's own tool server (node_repl, with browser backends) inside the "
-            "Antigravity CLI, so agy reuses Codex's tools instead of installing its own."
+            "Register Codex's own MCP tool servers inside the Antigravity CLI so agy reuses "
+            "Codex's tools (browser included) instead of installing its own. No names = all of "
+            "them; --list-codex-tools shows what is available."
         ),
+    )
+    parser.add_argument(
+        "--list-codex-tools",
+        action="store_true",
+        help="List the MCP servers Codex itself runs (candidates for --share-codex-tools).",
     )
     parser.add_argument("--dry-run", action="store_true", help="Report changes without writing.")
     args = parser.parse_args()
@@ -315,10 +340,17 @@ def main() -> int:
     print(f"env            : {', '.join(f'{k}={v}' for k, v in sorted(env.items())) or '(none)'}")
     print(f"codex config   : {args.codex_config} -> {write_codex_config(args.codex_config, block, args.remove, args.dry_run)}")
     print(f"cc-switch DB   : {args.db} -> {write_db(args.db, config, args.remove, args.dry_run)}")
-    if args.share_codex_tools or args.remove:
-        entry = codex_tool_entry(args.codex_config)
-        result = share_codex_tools(entry, args.agy, args.remove, args.dry_run)
-        print(f"agy tools      : {CODEX_TOOLS_ID} -> {result}")
+    entries = codex_tool_entries(args.codex_config)
+    if args.list_codex_tools:
+        if not entries:
+            print("codex tools    : (none found in Codex's config)")
+        for name, entry in sorted(entries.items()):
+            print(f"codex tool     : {name} -> {entry.get('command')}")
+    if args.share_codex_tools is not None or args.remove:
+        result = share_codex_tools(
+            entries, args.share_codex_tools or [], args.agy, args.remove, args.dry_run
+        )
+        print(f"agy tools      : {result}")
     return 0
 
 
