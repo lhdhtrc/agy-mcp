@@ -1328,9 +1328,9 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "antigravity_ask",
         "description": (
-            "Run one non-interactive prompt through the local Antigravity CLI (agy) and "
-            "return its answer. Uses the Google account already signed in to agy, so it "
-            "consumes that Antigravity/Gemini quota instead of the current provider."
+            "通过本机 Antigravity CLI（agy）跑一轮非交互提问并返回回答；"
+            "默认续接同一会话。用的是 agy 已登录的 Google 账号额度（Antigravity / Gemini），"
+            "不占用当前供应商的额度。"
         ),
         "inputSchema": ASK_SCHEMA,
     },
@@ -1347,8 +1347,8 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "antigravity_sessions",
         "description": (
-            "List or forget the Antigravity conversations this server has been tracking, "
-            "together with the conversations the CLI knows about locally."
+            "查看或遗忘本服务器跟踪的 Antigravity 会话，"
+            "并列出 CLI 本地已有的会话。"
         ),
         "inputSchema": {
             "type": "object",
@@ -1370,17 +1370,17 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "antigravity_quota",
         "description": (
-            "Show remaining Antigravity quota (weekly and 5-hour windows per model group). "
-            "Answered by the CLI itself: starts no turn and spends no quota."
+            "查看 Antigravity 剩余额度（按模型组的周窗口与 5 小时窗口）。"
+            "由 CLI 自身回答：不起 turn、不扣额度。"
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "antigravity_submit",
         "description": (
-            "Start an Antigravity turn in the background and return a job id immediately. "
-            "Use it for long jobs (deep analysis, long documents) so you are not blocked; "
-            "collect the answer later with antigravity_job. Same arguments as antigravity_ask."
+            "在后台启动一轮 Antigravity 作业并立刻返回 job id。"
+            "长作业（深度分析、长文档）用它避免阻塞；之后用 antigravity_job 取结果。"
+            "参数与 antigravity_ask 相同。"
         ),
         "inputSchema": ASK_SCHEMA,
     },
@@ -1399,8 +1399,8 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "antigravity_status",
         "description": (
-            "Report the resolved agy path, CLI version, working directory and whether the "
-            "account can list models (a sign-in probe). Use this to diagnose failures."
+            "报告 agy 路径、CLI 版本、工作目录、代理可见性、当日调用与 token、"
+            "耗时统计与登录探测；排查故障先看它。"
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
