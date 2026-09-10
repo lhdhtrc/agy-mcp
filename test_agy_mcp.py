@@ -531,6 +531,63 @@ def test_orphan_reaping_never_kills_unrelated_processes() -> None:
             sleeper.wait()
 
 
+def _make_repo_with_change() -> str:
+    """A throwaway git repo with one committed file and one uncommitted edit."""
+    repo = tempfile.mkdtemp(prefix="agy-mcp-repo-")
+    identity = ["-c", "user.email=test@example.com", "-c", "user.name=test"]
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    path = os.path.join(repo, "demo.py")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("value = 1\n")
+    subprocess.run(["git"] + identity + ["add", "demo.py"], cwd=repo, check=True)
+    subprocess.run(["git"] + identity + ["commit", "-qm", "init"], cwd=repo, check=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("added_line = 42\n")
+    return repo
+
+
+def test_diff_is_captured_locally_and_attached() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-diff-") as state:
+        repo = _make_repo_with_change()
+        responses = run_server(
+            [ask(1, "review it", session="diff-check", cwd=repo, diff=True)],
+            {"AGY_MCP_STATE_DIR": state},
+        )
+        text = responses[1]["result"]["content"][0]["text"]
+        assert "added_line = 42" in text, text[:400]
+        assert "demo.py" in text, text[:400]
+        assert text.endswith("review it"), text[-200:]
+        notes = [item["text"] for item in responses[1]["result"]["content"][1:]]
+        assert any("attached the local git diff" in note for note in notes), notes
+
+
+def test_diff_on_a_non_repo_is_reported_not_fatal() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-norepo-") as plain:
+        with tempfile.TemporaryDirectory(prefix="agy-mcp-diff2-") as state:
+            responses = run_server(
+                [ask(1, "hello", session="norepo-check", cwd=plain, diff=True)],
+                {"AGY_MCP_STATE_DIR": state},
+            )
+            result = responses[1]["result"]
+            assert result["isError"] is False, result
+            assert result["content"][0]["text"] == "echo: hello"
+            notes = [item["text"] for item in result["content"][1:]]
+            assert any("not a git working tree" in note for note in notes), notes
+
+
+def test_orphan_reaping_never_kills_unrelated_processes() -> None:
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
+    try:
+        agy_mcp._write_worker_pids([sleeper.pid])
+        agy_mcp.reap_orphan_workers()  # real guard: this pid is not the Antigravity CLI
+        time.sleep(0.5)
+        assert sleeper.poll() is None, "must not kill a process that is not agy"
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+            sleeper.wait()
+
+
 def test_read_only_tools_do_not_queue_behind_a_turn() -> None:
     """`models` must answer while a long turn is still running, not after it."""
     with tempfile.TemporaryDirectory(prefix="agy-mcp-fast-") as state:
@@ -591,6 +648,8 @@ TESTS = (
     test_models_are_returned_structured,
     test_sessions_record_token_totals,
     test_orphaned_workers_are_reaped,
+    test_diff_is_captured_locally_and_attached,
+    test_diff_on_a_non_repo_is_reported_not_fatal,
     test_orphan_reaping_never_kills_unrelated_processes,
     test_read_only_tools_do_not_queue_behind_a_turn,
 )

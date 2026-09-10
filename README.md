@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.3，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.1.4，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
@@ -194,6 +194,18 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 
 ## 切换会话与 handoff
 
+### 评审改动（`diff: true`）
+
+让 Antigravity 当第二个评审者时，**不要指望它自己跑 `git diff`**——实测在默认沙箱下这类任务几分钟都跑不完。
+服务器改为在本地抓 diff 再作为文本传进去：
+
+```
+antigravity_ask(prompt="逐条评审这些改动，按 file:line 给结论", diff=true, cwd="/path/to/repo")
+```
+
+它会附上 `git status --short` 与 `git diff HEAD`（无提交时回退到暂存+未暂存），超过
+`AGY_MCP_MAX_DIFF_CHARS` 会截断并注明；不是 git 仓库时会记一条说明并照常回答。想对比别的分支用 `diff_base: "main"`。
+
 人工切换：让客户端带不同的 `session` 名调用即可（`session: "review"` / `session: "writing"`）；
 **不指定就一直是同一个会话**。
 
@@ -233,6 +245,8 @@ Claude and GPT models    Five Hour Limit Remaining     100%
 | --- | --- | --- |
 | `prompt` | 必填 | 提示词 |
 | `files` | 无 | 让 Antigravity 自己去读的文件路径列表（比把文件内容粘进 prompt 更省 token） |
+| `diff` | `false` | 把**本地抓的**工作区 diff 作为上下文附上（评审改动用，不依赖 agent 自己跑 git） |
+| `diff_base` | `HEAD` | 配合 `diff` 指定对比的 git ref |
 | `session` | `default` | 会话名，同名 + 同 workspace 续接 |
 | `new_session` | `false` | 重开会话 |
 | `handoff` | `false` | 压成交接摘要后**开新会话**继续 |
@@ -308,6 +322,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `AGY_MCP_USAGE_ROTATE_MB` | `5` | 用量日志超过该大小就丢掉较旧的一半（`0` = 不轮转） |
 | `AGY_MCP_PROGRESS_INTERVAL_MS` | `400` | 进度通知最小间隔（`0` = 不节流） |
 | `AGY_MCP_MAX_PROMPT_CHARS` | `100000` | prompt 软上限；超了会提示改用 `files` 或让 agent 自己读 |
+| `AGY_MCP_MAX_DIFF_CHARS` | `60000` | `diff: true` 时附上的 diff 上限，超出截断并注明 |
 | `AGY_MCP_MAX_PARALLEL` | `1` | `>1` 时锁按会话粒度，允许多个不同会话并行（值为并发上限） |
 | `AGY_MCP_PREWARM` | `0` | 设 `1` 时服务器启动即拉起默认会话进程，第一次提问不必等冷启动 |
 | `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
@@ -370,13 +385,14 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 22 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 24 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
 覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**、
 进度通知（含文字片段）、自动 handoff、`--self-test`、默认权限、`files`、prompt 护栏、结构化 models、
 会话 token 累计、只读工具不排队、孤儿进程回收（含"不误杀无关进程"）。
+本地 diff 抓取（含非 git 仓库的降级路径）也在其中。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

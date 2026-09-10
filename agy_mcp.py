@@ -28,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.3"
+SERVER_VERSION = "0.1.4"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -66,6 +66,7 @@ DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
 DEFAULT_USAGE_ROTATE_MB = 5.0
 DEFAULT_PROGRESS_INTERVAL_MS = 400
 DEFAULT_MAX_PROMPT_CHARS = 100000
+DEFAULT_MAX_DIFF_CHARS = 60000
 HANDOFF_PROMPT = (
     "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
     "Requirements:\n"
@@ -438,6 +439,65 @@ def attach_files(prompt: str, files: Any) -> str:
     )
 
 
+def _git(args: List[str], cwd: str, timeout: float = 30) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def collect_diff(cwd: str, base: Optional[str], limit: int) -> Tuple[str, str]:
+    """Capture the working tree diff locally.
+
+    Letting the agent run `git diff` itself proved unreliable under the sandbox
+    (a plain request did not finish in minutes), so read it here and pass it as text.
+    """
+    code, out = _git(["rev-parse", "--is-inside-work-tree"], cwd)
+    if code != 0 or "true" not in out.lower():
+        return "", "not a git working tree, so no diff was attached"
+
+    target = base or "HEAD"
+    code, out = _git(["diff", target], cwd)
+    if code != 0:
+        # No commits yet (or an unknown ref): fall back to unstaged + staged.
+        _, unstaged = _git(["diff"], cwd)
+        _, staged = _git(["diff", "--cached"], cwd)
+        out = unstaged + staged
+        target = "the index"
+
+    _, status = _git(["status", "--short"], cwd)
+    parts = []
+    if status.strip():
+        parts.append("Changed paths (git status --short):\n" + status.strip())
+    if out.strip():
+        diff_text = out
+        if limit and len(diff_text) > limit:
+            diff_text = diff_text[:limit] + f"\n…(diff truncated; {len(out)} chars total)"
+        parts.append(f"Diff (`git diff {target}`):\n{diff_text.strip()}")
+    if not parts:
+        return "", "no uncommitted changes found, so no diff was attached"
+    return "\n\n".join(parts), ""
+
+
+def attach_diff(prompt: str, diff_text: str, source: str) -> str:
+    return (
+        f"Here is the current working tree state of `{source}` for context:\n\n"
+        f"{diff_text}\n\n"
+        f"Now complete this task:\n\n{prompt}"
+    )
+
+
 def mask_proxy(value: str) -> str:
     """Hide credentials in a proxy URL before showing it back to the model."""
     if "@" in value:
@@ -744,6 +804,7 @@ AUTO_HANDOFF = _env_int("AGY_MCP_AUTO_HANDOFF", 0) != 0
 USAGE_ROTATE_BYTES = int(_env_float("AGY_MCP_USAGE_ROTATE_MB", DEFAULT_USAGE_ROTATE_MB) * 1024 * 1024)
 PROGRESS_INTERVAL_MS = _env_int("AGY_MCP_PROGRESS_INTERVAL_MS", DEFAULT_PROGRESS_INTERVAL_MS)
 MAX_PROMPT_CHARS = _env_int("AGY_MCP_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS)
+MAX_DIFF_CHARS = _env_int("AGY_MCP_MAX_DIFF_CHARS", DEFAULT_MAX_DIFF_CHARS)
 MAX_PARALLEL = max(1, _env_int("AGY_MCP_MAX_PARALLEL", 1))
 PREWARM = _env_int("AGY_MCP_PREWARM", 0) != 0
 
@@ -1073,6 +1134,18 @@ ASK_SCHEMA: Dict[str, Any] = {
                 "pasting file contents into the prompt."
             ),
         },
+        "diff": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Attach the working tree diff (captured locally with git) as context; "
+                "handy for 'review my changes' without the agent having to run git itself."
+            ),
+        },
+        "diff_base": {
+            "type": "string",
+            "description": "Git ref to diff against when `diff` is used (default: HEAD).",
+        },
         "model": {"type": "string", "description": "Optional Antigravity model id."},
         "effort": {
             "type": "string",
@@ -1257,6 +1330,14 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     entry = entry if isinstance(entry, dict) else {}
     notes: List[str] = []
     resumed = False
+
+    if args.get("diff") or args.get("diff_base"):
+        diff_text, diff_note = collect_diff(workspace, args.get("diff_base"), MAX_DIFF_CHARS)
+        if diff_note:
+            notes.append(diff_note)
+        if diff_text:
+            prompt = attach_diff(prompt, diff_text, workspace)
+            notes.append(f"attached the local git diff ({len(diff_text)} chars)")
 
     conversation = explicit_conversation
     if conversation is None and not new_session and not continue_recent:
