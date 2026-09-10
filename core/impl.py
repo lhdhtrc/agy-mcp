@@ -49,6 +49,21 @@ METADATA_TIMEOUT_SEC = 300
 UNLIMITED_PRINT_TIMEOUT = "24h"
 # 路径与通用工具已抽到 core/config.py（唯一读环境变量的地方）
 from core.config import (  # noqa: E402
+    DEFAULT_MIN_INTERVAL_SEC,
+    DEFAULT_MAX_CALLS_PER_DAY,
+    DEFAULT_SESSION,
+    DEFAULT_WORKER_IDLE_SEC,
+    DEFAULT_LONG_CONTEXT_TOKENS,
+    DEFAULT_SHUTDOWN_GRACE_SEC,
+    DEFAULT_USAGE_ROTATE_MB,
+    DEFAULT_PROGRESS_INTERVAL_MS,
+    DEFAULT_MAX_PROMPT_CHARS,
+    DEFAULT_MAX_DIFF_CHARS,
+    DEFAULT_MODEL,
+    DEFAULT_MODEL_PREFERENCE,
+    DEFAULT_QUOTA_WARN_PERCENT,
+    DEFAULT_QUOTA_REFRESH_SEC,
+    DEFAULT_MODEL_ID,
     AGY_CLI_HOME,
     SESSIONS_PATH,
     STATE_DIR,
@@ -79,28 +94,11 @@ USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
 _USAGE_SINCE_ROTATE = 0
 # Antigravity CLI 自己的状态（会话 id、workspace 索引）放在这里。
 LOCK_WAIT_SEC = 600
-DEFAULT_MIN_INTERVAL_SEC = 5.0
-DEFAULT_MAX_CALLS_PER_DAY = 200
-DEFAULT_SESSION = "default"
 ANSWER_KEYS = ("response", "result", "text", "output", "content", "message", "answer")
 # 每次新起 `agy -p` 进程都要重做鉴权与模型/额度初始化（约 5 秒）；常驻的
 # `--input-format stream-json` 进程服务一个会话，热轮约 1.5 秒。
-DEFAULT_WORKER_IDLE_SEC = 900.0
 # 一个 Codex 会话对应一个 MCP 服务器实例，因此会话表按实例隔离，两个会话不会抢同一个
 # Antigravity 会话；新实例会沿用上一个实例的映射，除非检测到另一个实例仍活跃。
-DEFAULT_LONG_CONTEXT_TOKENS = 100000
-DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
-DEFAULT_USAGE_ROTATE_MB = 5.0
-DEFAULT_PROGRESS_INTERVAL_MS = 400
-DEFAULT_MAX_PROMPT_CHARS = 100000
-DEFAULT_MAX_DIFF_CHARS = 60000
-DEFAULT_MODEL = "gemini-3.8-flash-high"
-DEFAULT_MODEL_PREFERENCE = (
-    "gemini-3.8-flash-high,gemini-3.1-pro-high,claude-sonnet-4-6,"
-    "claude-opus-4-6-thinking,gpt-oss-120b-medium"
-)
-DEFAULT_QUOTA_WARN_PERCENT = 10.0
-DEFAULT_QUOTA_REFRESH_SEC = 300.0
 HANDOFF_PROMPT = (
     "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
     "Requirements:\n"
@@ -613,7 +611,6 @@ MODEL_PREFERENCE = [
     for item in (os.environ.get("AGY_MCP_MODEL_PREFERENCE") or DEFAULT_MODEL_PREFERENCE).split(",")
     if item.strip()
 ]
-DEFAULT_MODEL_ID = os.environ.get("AGY_MCP_DEFAULT_MODEL", DEFAULT_MODEL)
 QUOTA_WARN_PERCENT = _env_float("AGY_MCP_QUOTA_WARN_PERCENT", DEFAULT_QUOTA_WARN_PERCENT)
 QUOTA_REFRESH_SEC = _env_float("AGY_MCP_QUOTA_REFRESH_SEC", DEFAULT_QUOTA_REFRESH_SEC)
 

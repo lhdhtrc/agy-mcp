@@ -39,3 +39,23 @@ def log(message: str) -> None:
     """诊断日志统一走 stderr，避免污染 MCP 的 stdout 通道。"""
     sys.stderr.write(f"[agy-mcp] {message}\n")
     sys.stderr.flush()
+
+# 各类默认值：集中一处，其它模块按名导入（环境变量覆盖留在各自的 *_SEC / *_TOKENS 常量里）
+DEFAULT_MIN_INTERVAL_SEC = 5.0
+DEFAULT_MAX_CALLS_PER_DAY = 200
+DEFAULT_SESSION = "default"
+DEFAULT_WORKER_IDLE_SEC = 900.0
+DEFAULT_LONG_CONTEXT_TOKENS = 100000
+DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
+DEFAULT_USAGE_ROTATE_MB = 5.0
+DEFAULT_PROGRESS_INTERVAL_MS = 400
+DEFAULT_MAX_PROMPT_CHARS = 100000
+DEFAULT_MAX_DIFF_CHARS = 60000
+DEFAULT_MODEL = "gemini-3.8-flash-high"
+DEFAULT_MODEL_PREFERENCE = (
+    "gemini-3.8-flash-high,gemini-3.1-pro-high,claude-sonnet-4-6,"
+    "claude-opus-4-6-thinking,gpt-oss-120b-medium"
+)
+DEFAULT_QUOTA_WARN_PERCENT = 10.0
+DEFAULT_QUOTA_REFRESH_SEC = 300.0
+DEFAULT_MODEL_ID = os.environ.get("AGY_MCP_DEFAULT_MODEL", DEFAULT_MODEL)
