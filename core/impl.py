@@ -86,6 +86,8 @@ from core.config import (
     _env_int,
     log,
 )
+# 协议层纯函数（先搬 text_result，其余逐个搬）
+from core.protocol import text_result  # noqa: E402,F401
 # 额度解析、后台刷新、配额告警与 model=auto 选型已抽到 core/quota.py
 from core import quota as quota  # noqa: E402
 from core.quota import *  # noqa: E402,F401,F403 —— 名字多且会被测试补丁，集中导入
@@ -395,11 +397,6 @@ def proxy_env_report() -> Dict[str, Any]:
     return report
 
 
-def text_result(text: str, is_error: bool = False, notes: Optional[List[str]] = None) -> Dict[str, Any]:
-    content = [{"type": "text", "text": text}]
-    for note in notes or []:
-        content.append({"type": "text", "text": f"[agy-mcp] {note}"})
-    return {"content": content, "isError": is_error}
 
 
 def join_streams(code: int, out: str, err: str) -> str:
