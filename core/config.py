@@ -20,6 +20,18 @@ AGY_CLI_HOME = os.environ.get("AGY_CLI_HOME") or os.path.join(
     os.path.expanduser("~"), ".gemini", "antigravity-cli"
 )
 
+# MCP 服务器标识与协议版本（版本号发版时改这里）
+SERVER_NAME = "antigravity"
+SERVER_VERSION = "0.1.8"
+SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+DEFAULT_PROTOCOL = "2024-11-05"
+# 0 表示不限时：真实的 agent 作业可能跑很久，而 CLI 自带的 print 超时默认只有 5 分钟，
+# 正是它把长任务掐断的。
+DEFAULT_TIMEOUT_SEC = int(os.environ.get("AGY_MCP_DEFAULT_TIMEOUT_SEC") or 0)
+TIMEOUT_GRACE_SEC = 30
+# 元数据类调用（models / quota / version）仍需短超时，否则 status 之类可能一直挂着。
+UNLIMITED_PRINT_TIMEOUT = "24h"
+
 
 def _env_float(name: str, default: float) -> float:
     """读一个浮点型环境变量；缺失或非法时用默认值。"""

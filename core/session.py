@@ -11,14 +11,21 @@ import json
 import os
 import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from core.agy import CREATE_NO_WINDOW
 from core.config import AGY_CLI_HOME, SESSIONS_PATH, STATE_DIR, _env_float, log
 
+if TYPE_CHECKING:  # 只为类型标注，避免与 core/worker.py 形成导入环
+    from core.worker import Worker
+
 WORKER_PID_FILE = os.path.join(STATE_DIR, "workers.json")
 
-# 每个 MCP 服务器实例一个身份：一个 Codex 会话对应一个实例
+# 每个 MCP 服务器实例一个身份：一个 Codex 会话对应一个实例。
+# 每次新起 `agy -p` 进程都要重做鉴权与模型/额度初始化（约 5 秒），常驻的
+# `--input-format stream-json` 进程服务一个会话，热轮约 1.5 秒；会话表按实例隔离，
+# 两个 Codex 会话才不会抢同一个 Antigravity 会话。新实例会沿用上一个实例的映射，
+# 除非检测到另一个实例仍活跃。
 INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
 # 判定"另一个实例仍活跃"的时间窗（秒）
 ADOPT_WINDOW_SEC = _env_float("AGY_MCP_INSTANCE_WINDOW_SEC", 120.0)

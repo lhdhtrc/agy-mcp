@@ -11,25 +11,14 @@
 
 from __future__ import annotations
 
-import atexit
-import contextlib
-import hashlib
 import json
 import os
-import queue
-import shlex
-import shutil
-import signal
 import subprocess
 import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.8"
-SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
-DEFAULT_PROTOCOL = "2024-11-05"
 # 进程控制（定位 CLI、跑命令、杀进程树）已抽到 core/agy.py
 from core.agy import (
     CREATE_NO_WINDOW,
@@ -40,12 +29,6 @@ from core.agy import (
     resolve_agy,
     run_agy,
 )
-# 0 表示不限时：真实的 agent 作业可能跑很久，而 CLI 自带的 print 超时默认只有 5 分钟，
-# 正是它把长任务掐断的。
-DEFAULT_TIMEOUT_SEC = int(os.environ.get("AGY_MCP_DEFAULT_TIMEOUT_SEC") or 0)
-TIMEOUT_GRACE_SEC = 30
-# 元数据类调用（models / quota / version）仍需短超时，否则 status 之类可能一直挂着。
-UNLIMITED_PRINT_TIMEOUT = "24h"
 # 路径与通用工具已抽到 core/config.py（唯一读环境变量的地方）
 from core.config import (
     METADATA_TIMEOUT_SEC,  # noqa: E402
@@ -55,36 +38,55 @@ from core.config import (
     LONG_CONTEXT_TOKENS,
     SHUTDOWN_GRACE_SEC,
     AUTO_HANDOFF,
-    USAGE_ROTATE_BYTES,
-    PROGRESS_INTERVAL_MS,
     MAX_PROMPT_CHARS,
     MAX_DIFF_CHARS,
-    MAX_PARALLEL,
     PREWARM,
-    MODEL_PREFERENCE,
-    QUOTA_WARN_PERCENT,
-    QUOTA_REFRESH_SEC,
-    DEFAULT_MIN_INTERVAL_SEC,
-    DEFAULT_MAX_CALLS_PER_DAY,
     DEFAULT_SESSION,
-    DEFAULT_WORKER_IDLE_SEC,
-    DEFAULT_LONG_CONTEXT_TOKENS,
-    DEFAULT_SHUTDOWN_GRACE_SEC,
-    DEFAULT_USAGE_ROTATE_MB,
-    DEFAULT_PROGRESS_INTERVAL_MS,
-    DEFAULT_MAX_PROMPT_CHARS,
-    DEFAULT_MAX_DIFF_CHARS,
     DEFAULT_MODEL,
-    DEFAULT_MODEL_PREFERENCE,
-    DEFAULT_QUOTA_WARN_PERCENT,
-    DEFAULT_QUOTA_REFRESH_SEC,
-    DEFAULT_MODEL_ID,
     AGY_CLI_HOME,
     SESSIONS_PATH,
     STATE_DIR,
-    _env_float,
-    _env_int,
     log,
+)
+# MCP 协议常量
+from core.config import (  # noqa: E402,F401
+    DEFAULT_PROTOCOL,
+    DEFAULT_TIMEOUT_SEC,
+    SERVER_NAME,
+    SERVER_VERSION,
+    SUPPORTED_PROTOCOLS,
+    TIMEOUT_GRACE_SEC,
+    UNLIMITED_PRINT_TIMEOUT,
+)
+# 调用护栏、跨进程锁与用量统计已抽到 core/guard.py
+from core.guard import (  # noqa: E402,F401
+    USAGE_PATH,
+    calls_today,
+    log_usage,
+    merge_usage,
+    read_state,
+    turn_guard,
+    usage_stats,
+    write_state,
+    _today,
+)
+# 本地探测（工作树 diff、代理环境）已抽到 core/diag.py
+from core.diag import collect_diff, mask_proxy, proxy_env_report  # noqa: E402,F401
+# 异步任务、取消与进度通知已抽到 core/tasks.py
+from core.tasks import (  # noqa: E402,F401
+    ACTIVE_TASKS,
+    SEND_LOCK,
+    TASKS_LOCK,
+    TOOL_QUEUE,
+    ActiveTask,
+    cancel_task,
+    current_task,
+    finish_task,
+    is_cancelled,
+    notify_progress,
+    register_task,
+    send,
+    _TASK_LOCAL,
 )
 # 协议层纯函数（已搬 text_result / join_streams / parse_json_output / 进度与流解析，剩余逐个搬）
 from core.protocol import (  # noqa: E402,F401
@@ -147,316 +149,6 @@ from core.session import (  # noqa: E402,F401
     write_sessions,
 )
 
-# 护栏：CLI 是官方客户端，但额度本是给人驱动 agent 用的。串行化调用、限制每日总量，
-# 是为了让流量形状保持"正常"——这也是包装层在账号风险上唯一能做的事。
-LOCK_PATH = os.path.join(STATE_DIR, "call.lock")
-STATE_PATH = os.path.join(STATE_DIR, "state.json")
-USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
-_USAGE_SINCE_ROTATE = 0
-# Antigravity CLI 自己的状态（会话 id、workspace 索引）放在这里。
-LOCK_WAIT_SEC = 600
-# 每次新起 `agy -p` 进程都要重做鉴权与模型/额度初始化（约 5 秒）；常驻的
-# `--input-format stream-json` 进程服务一个会话，热轮约 1.5 秒。
-# 一个 Codex 会话对应一个 MCP 服务器实例，因此会话表按实例隔离，两个会话不会抢同一个
-# Antigravity 会话；新实例会沿用上一个实例的映射，除非检测到另一个实例仍活跃。
-class FileLock:
-    """Cross-process advisory lock so parallel clients queue instead of racing."""
-
-    def __init__(self, path: str, timeout: float) -> None:
-        self.path = path
-        self.timeout = timeout
-        self.handle = None
-
-    def __enter__(self) -> "FileLock":
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self.handle = open(self.path, "a+b")
-        if self.handle.tell() == 0:
-            self.handle.write(b"0")
-            self.handle.flush()
-        deadline = time.monotonic() + self.timeout
-        while True:
-            try:
-                self.handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("another Antigravity call is still running")
-                time.sleep(0.5)
-
-    def __exit__(self, *exc_info: Any) -> None:
-        try:
-            if self.handle is not None:
-                self.handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            if self.handle is not None:
-                self.handle.close()
-                self.handle = None
-
-
-def _today() -> str:
-    return time.strftime("%Y-%m-%d")
-
-
-def read_state() -> Dict[str, Any]:
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as handle:
-            state = json.load(handle)
-        if not isinstance(state, dict):
-            return {}
-        return state
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def write_state(state: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STATE_PATH, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, ensure_ascii=False)
-    except OSError as exc:
-        log(f"could not persist guard state: {exc}")
-
-
-def calls_today(state: Dict[str, Any]) -> int:
-    if state.get("day") != _today():
-        return 0
-    try:
-        return int(state.get("calls", 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def log_usage(entry: Dict[str, Any]) -> None:
-    global _USAGE_SINCE_ROTATE
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(USAGE_PATH, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        log(f"could not append usage log: {exc}")
-        return
-    _USAGE_SINCE_ROTATE += 1
-    if _USAGE_SINCE_ROTATE >= 25:
-        _USAGE_SINCE_ROTATE = 0
-        rotate_usage_log()
-
-
-def rotate_usage_log() -> None:
-    """Keep the usage log from growing without bound: drop the older half past the limit."""
-    try:
-        if not USAGE_ROTATE_BYTES or os.path.getsize(USAGE_PATH) < USAGE_ROTATE_BYTES:
-            return
-        with open(USAGE_PATH, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()
-        keep = lines[len(lines) // 2 :]
-        with open(USAGE_PATH, "w", encoding="utf-8") as handle:
-            handle.writelines(keep)
-        log(f"rotated usage log: kept {len(keep)} of {len(lines)} lines")
-    except OSError as exc:
-        log(f"could not rotate usage log: {exc}")
-
-
-def usage_stats(limit: int = 200) -> Dict[str, Any]:
-    """p50/p95 turn duration over the most recent usage entries."""
-    try:
-        with open(USAGE_PATH, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()[-limit:]
-    except OSError:
-        return {}
-    durations = []
-    for line in lines:
-        try:
-            value = json.loads(line).get("duration_ms")
-        except (json.JSONDecodeError, AttributeError):
-            continue
-        if isinstance(value, (int, float)):
-            durations.append(float(value))
-    if not durations:
-        return {}
-    durations.sort()
-    pick = lambda q: durations[min(len(durations) - 1, int(q * len(durations)))]  # noqa: E731
-    return {
-        "samples": len(durations),
-        "p50_ms": int(pick(0.5)),
-        "p95_ms": int(pick(0.95)),
-        "max_ms": int(durations[-1]),
-    }
-
-
-def merge_usage(target: Dict[str, Any], payload: Optional[Dict[str, Any]]) -> None:
-    """Fold a turn's token usage into a running total (handoff runs two turns)."""
-    if not payload:
-        return
-    usage = payload.get("usage")
-    if not isinstance(usage, dict):
-        return
-    for key, value in usage.items():
-        if isinstance(value, (int, float)):
-            target[key] = int(target.get(key, 0) or 0) + int(value)
-
-
-def collect_diff(cwd: str, base: Optional[str], limit: int) -> Tuple[str, str]:
-    """Capture the working tree diff locally.
-
-    Letting the agent run `git diff` itself proved unreliable under the sandbox
-    (a plain request did not finish in minutes), so read it here and pass it as text.
-    """
-    code, out = _git(["rev-parse", "--is-inside-work-tree"], cwd)
-    if code != 0 or "true" not in out.lower():
-        return "", "not a git working tree, so no diff was attached"
-
-    target = base or "HEAD"
-    code, out = _git(["diff", target], cwd)
-    if code != 0:
-        # 还没有提交（或 ref 不存在）：退回到"未暂存 + 已暂存"。
-        _, unstaged = _git(["diff"], cwd)
-        _, staged = _git(["diff", "--cached"], cwd)
-        out = unstaged + staged
-        target = "the index"
-
-    _, status = _git(["status", "--short"], cwd)
-    parts = []
-    if status.strip():
-        parts.append("Changed paths (git status --short):\n" + status.strip())
-    if out.strip():
-        diff_text = out
-        if limit and len(diff_text) > limit:
-            diff_text = diff_text[:limit] + f"\n…(diff truncated; {len(out)} chars total)"
-        parts.append(f"Diff (`git diff {target}`):\n{diff_text.strip()}")
-    if not parts:
-        return "", "no uncommitted changes found, so no diff was attached"
-    return "\n\n".join(parts), ""
-
-
-def mask_proxy(value: str) -> str:
-    """Hide credentials in a proxy URL before showing it back to the model."""
-    if "@" in value:
-        scheme, _, rest = value.partition("://")
-        return f"{scheme}://***@{rest.rpartition('@')[2]}" if scheme else f"***@{value.rpartition('@')[2]}"
-    return value
-
-
-def proxy_env_report() -> Dict[str, Any]:
-    report: Dict[str, Any] = {}
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
-        value = os.environ.get(key)
-        if value:
-            report[key] = mask_proxy(value) if "PROXY" in key.upper() and "NO_PROXY" not in key.upper() else value
-    return report
-
-
-
-
-class ActiveTask:
-    """A tool call running off the main loop, so cancellations can reach it."""
-
-    def __init__(self, request_id: Any, progress_token: Any = None) -> None:
-        self.request_id = request_id
-        self.progress_token = progress_token
-        self.last_progress = 0.0
-        self.cancelled = threading.Event()
-        self.suppress_response = False
-        self.worker: Optional["Worker"] = None
-        self.process: Optional[subprocess.Popen] = None
-
-    def bind(self, worker: Optional["Worker"]) -> None:
-        self.worker = worker
-        if worker is not None and self.cancelled.is_set():
-            worker.stop()  # cancelled while this call was still starting up
-
-
-ACTIVE_TASKS: Dict[Any, ActiveTask] = {}
-TASKS_LOCK = threading.Lock()
-SEND_LOCK = threading.Lock()
-TOOL_QUEUE: "queue.Queue[Tuple[Dict[str, Any], ActiveTask]]" = queue.Queue()
-_TASK_LOCAL = threading.local()
-
-
-def current_task() -> Optional[ActiveTask]:
-    return getattr(_TASK_LOCAL, "task", None)
-
-
-def is_cancelled() -> bool:
-    task = current_task()
-    return task is not None and task.cancelled.is_set()
-
-
-def register_task(task: ActiveTask) -> None:
-    with TASKS_LOCK:
-        ACTIVE_TASKS[task.request_id] = task
-
-
-def finish_task(request_id: Any) -> None:
-    with TASKS_LOCK:
-        ACTIVE_TASKS.pop(request_id, None)
-
-
-def cancel_task(request_id: Any) -> bool:
-    """Stop the turn behind `request_id`: the client no longer waits, so neither should we."""
-    with TASKS_LOCK:
-        task = ACTIVE_TASKS.get(request_id)
-    if task is None:
-        return False
-    task.suppress_response = True
-    task.cancelled.set()
-    log(f"cancel {request_id!r}: stopping the Antigravity turn")
-    if task.worker is not None:
-        task.worker.stop()
-    if task.process is not None:
-        kill_process_tree(task.process)
-    return True
-
-
-
-
-def notify_progress(
-    progress: float,
-    message: str,
-    task: Optional[ActiveTask] = None,
-    force: bool = False,
-) -> None:
-    """Tell the client how a long turn is going (only if it asked for progress)."""
-    task = task or current_task()
-    if task is None or task.progress_token is None:
-        return
-    now = time.monotonic()
-    if (
-        not force
-        and PROGRESS_INTERVAL_MS > 0
-        and (now - task.last_progress) * 1000 < PROGRESS_INTERVAL_MS
-    ):
-        return
-    task.last_progress = now
-    with SEND_LOCK:
-        send(
-            {
-                "jsonrpc": "2.0",
-                "method": "notifications/progress",
-                "params": {
-                    "progressToken": task.progress_token,
-                    "progress": round(float(progress), 3),
-                    "message": message,
-                },
-            }
-        )
-
-
 def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_recent: bool) -> List[str]:
     """Flags that must hold for the life of a session process."""
     flags: List[str] = []
@@ -486,7 +178,6 @@ def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_re
     return flags
 
 
-PARALLEL_SLOTS = threading.BoundedSemaphore(MAX_PARALLEL) if MAX_PARALLEL > 1 else None
 FAST_TOOLS = frozenset(
     {
         "antigravity_status",
@@ -498,32 +189,6 @@ FAST_TOOLS = frozenset(
         "antigravity_job",
     }
 )
-
-
-def session_lock_path(session_name: str, workspace: str) -> str:
-    digest = hashlib.sha1(f"{session_name}|{workspace}".encode("utf-8")).hexdigest()[:16]
-    return os.path.join(STATE_DIR, f"call-{digest}.lock")
-
-
-@contextlib.contextmanager
-def turn_guard(session_name: str, workspace: str) -> Any:
-    """Serialize Antigravity turns.
-
-    Default: one turn at a time across every process (extra safety for the account).
-    With AGY_MCP_MAX_PARALLEL > 1 the lock becomes per session, so two different
-    conversations may run side by side, bounded by that many slots.
-    """
-    if PARALLEL_SLOTS is None:
-        with FileLock(LOCK_PATH, LOCK_WAIT_SEC):
-            yield
-        return
-    if not PARALLEL_SLOTS.acquire(timeout=LOCK_WAIT_SEC):
-        raise TimeoutError("no free Antigravity slot")
-    try:
-        with FileLock(session_lock_path(session_name, workspace), LOCK_WAIT_SEC):
-            yield
-    finally:
-        PARALLEL_SLOTS.release()
 
 
 def prewarm_default_session() -> None:
@@ -1431,14 +1096,6 @@ def handle_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if request_id is None:
         return None
     return None
-
-
-def send(payload: Dict[str, Any]) -> None:
-    # 用 errors="replace"：子进程回传孤立代理字符（它用 surrogateescape 解出的非法字节）时，
-    # 绝不能因为写响应就把整个服务器弄崩。
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
-    sys.stdout.buffer.write(data + b"\n")
-    sys.stdout.buffer.flush()
 
 
 def _run_tool_call(message: Dict[str, Any], task: ActiveTask) -> None:
