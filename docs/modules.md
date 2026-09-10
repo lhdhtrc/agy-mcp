@@ -26,6 +26,11 @@
 为什么 `tasks` 单独一层：`tools` 要发进度、要能被取消，`server` 要收响应，两边都得认识
 "当前任务"；把它单独放一层，就不需要 `tools` 与 `server` 互相 import。
 
+`hooks/` 不在 MCP 服务器里：它是给 **agy** 装的定制（`PreToolUse` 钩子 `deny_browser.py`，
+由 `register_agy_mcp.py --disable-browser` 写进 `~/.gemini/config/hooks.json`），用来拒掉
+agy 自带那套装不上的浏览器工具。仓库根的 `register_agy_mcp.py` 负责注册/卸载与写钩子；
+`pyproject.toml` 只提供元数据与 console_scripts，版本号动态读 `core.config.SERVER_VERSION`。
+
 `core/__init__.py` 会把常用公开名再导出一遍，所以 `import core` 之后可以直接用
 `core.extract_answer(...)`、`core.TOOLS`。模块对象本身也一直可用（`core.session.INSTANCE_ID`）。
 
@@ -50,8 +55,8 @@
 ## 验收命令
 
 ```bash
-python3 -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
-python3 test_agy_mcp.py          # 37 项，全绿
+python3 -m compileall -q core hooks main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
+python3 test_agy_mcp.py          # 40 项，全绿
 python3 agy_mcp.py --list-tools  # 8 个工具
 python3 main.py --status         # 走一遍真实 CLI（需要登录过的 agy）
 ```

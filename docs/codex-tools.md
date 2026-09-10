@@ -14,8 +14,25 @@ failed to install playwright: could not install driver: ... 404 (404 Not Found)
 ```
 
 二进制里确认它认 `PLAYWRIGHT_DOWNLOAD_HOST` / `PLAYWRIGHT_DRIVER_PATH` / `PLAYWRIGHT_NODEJS_PATH`，
-所以兜底修法是把下载地址指到
-`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.playwright.dev/dbazure/download/playwright`。
+原则上可以把下载地址指到
+`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.playwright.dev/dbazure/download/playwright`，
+但**现在直接把它禁掉更省事**：
+
+```bash
+python3 register_agy_mcp.py --disable-browser
+```
+
+它在 agy 的全局定制文件 `~/.gemini/config/hooks.json` 里装一条 `PreToolUse` 钩子
+（脚本是仓库里的 `hooks/deny_browser.py`），命中 `browser|playwright` 一族的工具就返回
+`{"decision": "deny"}`，agent 只能改走共享的 Codex 工具。几点实测结论：
+
+- agy 支持这套钩子，启动日志能看到 `hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)`；
+- **钩子命令跑不起来 = 那一轮直接失败**（`Agent execution terminated due to error`），
+  所以注册脚本会先跑一次钩子命令、确认能返回 `deny` 才写盘；
+- Windows 下命令不能带引号：agy 用 `cmd /c <command>` 执行，`"C:\py.exe" "hook.py"`
+  会被 cmd 拆坏（见 `hook_command()` 的注释）；
+- 会话启动时 CLI 仍会尝试安装 playwright 驱动（约几秒后 404），这不是工具调用，钩子拦不住；
+- 想恢复自带的浏览器：`python3 register_agy_mcp.py --disable-browser --remove`。
 
 ## 把 Codex 的工具注册进 agy
 
@@ -47,8 +64,8 @@ agy mcp list
 ## 注意事项
 
 - Codex 的安装路径里带构建哈希，**Codex 升级后要重跑 `--share-codex-tools`**。
-- 这是挂在 Codex 私有组件上的用法，不代表官方支持；失效就退回上面的 Playwright 下载地址，
-  或改在 Antigravity IDE 里跑。
+- 这是挂在 Codex 私有组件上的用法，不代表官方支持；失效就把 `PLAYWRIGHT_DOWNLOAD_HOST`
+  指到可用镜像（见上节）或改在 Antigravity IDE 里跑。
 - 这些工具以 agy 的权限运行：保持沙箱开启，只共享你信任的服务器。
 
 ## 能活过客户端重启的长作业

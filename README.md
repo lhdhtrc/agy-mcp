@@ -41,6 +41,15 @@ python3 agy_mcp.py --self-test
 python3 agy_mcp.py --status
 ```
 
+也支持 pip 安装（纯标准库，零运行期依赖；Python 3.9 / 3.10 需要 `tomli` 那个 extra）：
+
+```bash
+pip install .            # 提供 agy-mcp 与 agy-mcp-register 两个命令
+pip install ".[tomli]"   # Python < 3.11 注册脚本用得到 tomllib
+```
+
+版本号只维护一处：`core/config.py` 的 `SERVER_VERSION`，`pyproject.toml` 用 `dynamic` 读它。
+
 `--self-test` 会逐步打印检查结果，最后给出 `self-test OK` 或失败项清单：
 
 - 基础：agy 路径、代理、版本、登录、额度（额度那步不扣额度）
@@ -423,6 +432,21 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 
 见 [docs/codex-tools.md](docs/codex-tools.md)：为什么（Playwright 旧 CDN 404）、一条命令共享 Codex 的工具、实测结果与注意事项。
 
+**自带浏览器建议直接禁用**：agy 内置的浏览器驱动是 playwright-go，下载源已经全部 404，
+装不上（每次会话启动还会白试一遍）。让它用共享进来的 Codex 工具联网更实际：
+
+```bash
+python3 register_agy_mcp.py --disable-browser     # 安装；--remove 可卸载
+```
+
+它往 `~/.gemini/config/hooks.json` 写一条 agy 的 `PreToolUse` 钩子（`hooks/deny_browser.py`），
+命中 `browser|playwright` 一族的工具时直接 `deny`，agent 会转而用共享的 MCP 工具。安装前会**实测钩子命令**
+（命令跑不起来时 agy 会把那一轮判成失败，所以不能盲写）。实测 `agy` 的日志确认会加载：
+`hooks_manager.go: loaded 1 named hooks from 1 hooks.json file(s)`。
+
+注意两点：会话启动时 CLI 仍会尝试安装 playwright 驱动（约几秒，然后 404），这个没有开关可关；
+钩子只在**工具调用**前生效。
+
 ## 排障与已知边界
 
 见 [docs/troubleshooting.md](docs/troubleshooting.md)：症状 → 原因 → 处理，以及已知边界与兼容性矩阵。
@@ -430,15 +454,16 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 ## 开发
 
 ```bash
-python3 -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
-python3 test_agy_mcp.py     # 37 项离线测试：不需要网络、账号或 agy
+python3 -m compileall -q core hooks main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
+python3 test_agy_mcp.py     # 40 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
 覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**、
 进度通知（含文字片段）、自动 handoff、`--self-test`、默认权限、`files`、prompt 护栏、结构化 models、
 会话 token 累计、只读工具不排队、`new_session` 真的换会话、预热进程被复用且不会被拿去续接、
-中断的轮次保住粘住的 model/effort、孤儿进程回收（含"不误杀无关进程"与"不误杀另活在跑的实例"）。
+中断的轮次保住粘住的 model/effort、失败轮次如实报错且照样记账、孤儿进程回收（含"不误杀无关进程"
+与"不误杀另活在跑的实例"）、`--id` 多账号注册、浏览器钩子的安装/卸载与"钩子命令必须真能跑"。
 本地 diff 抓取（含非 git 仓库的降级路径）也在其中。
 `tests/fixtures/stream_turn.ndjson` 是录下来的**真实** stream 转写（已脱敏），用来防协议漂移：
 改解析器时不用装 agy 也能发现回归。
