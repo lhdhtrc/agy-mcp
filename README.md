@@ -134,7 +134,7 @@ type = "stdio"
 command = "python3"
 args = ["/Users/you/agy-mcp/agy_mcp.py"]
 startup_timeout_sec = 30
-tool_timeout_sec = 86400
+tool_timeout_sec = 604800
 
 [mcp_servers.antigravity.env]
 AGY_BIN = "/Users/you/.local/bin/agy"
@@ -151,7 +151,7 @@ type = "stdio"
 command = 'C:\Python312\python.exe'
 args = ['C:\tools\agy-mcp\agy_mcp.py']
 startup_timeout_sec = 30
-tool_timeout_sec = 86400
+tool_timeout_sec = 604800
 
 [mcp_servers.antigravity.env]
 AGY_BIN = 'C:\Users\you\AppData\Local\agy\bin\agy.exe'
@@ -161,7 +161,7 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 ```
 
 > `tool_timeout_sec` 给足：轮次默认不限时，客户端的工具超时才是最后一道闸（默认值往往只有几分钟，
-> 会把长任务掐断）。这里写 86400（一天）。
+> 会把长任务掐断）。这里写 604800（一周）——多天的任务，客户端这一层不能成为瓶颈。
 
 ## 提供的工具
 
