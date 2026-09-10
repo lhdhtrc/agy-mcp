@@ -1,0 +1,1374 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 agy-mcp contributors
+"""agy-mcp: expose the Antigravity CLI (agy) to MCP clients such as Codex.
+
+Transport: MCP over stdio, newline-delimited JSON-RPC 2.0 (no Content-Length framing).
+Only the Python standard library is used, so any MCP client can spawn this file
+directly without installing dependencies.
+
+The CLI keeps its own Google sign-in state; this server never touches credentials.
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+SERVER_NAME = "antigravity"
+SERVER_VERSION = "0.1.0"
+SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+DEFAULT_PROTOCOL = "2024-11-05"
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+DEFAULT_TIMEOUT_SEC = 300
+TIMEOUT_GRACE_SEC = 30
+
+# Guard rails: the CLI is the vendor's own client, but quota is meant for a human
+# driving an agent. Serialising calls and capping daily volume keeps the traffic
+# shape ordinary, which is the main thing a wrapper can do about account risk.
+STATE_DIR = os.environ.get("AGY_MCP_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".agy-mcp")
+LOCK_PATH = os.path.join(STATE_DIR, "call.lock")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
+SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
+# Antigravity CLI keeps its own state (conversation ids, workspace index) here.
+AGY_CLI_HOME = os.environ.get("AGY_CLI_HOME") or os.path.join(
+    os.path.expanduser("~"), ".gemini", "antigravity-cli"
+)
+LOCK_WAIT_SEC = 600
+DEFAULT_MIN_INTERVAL_SEC = 5.0
+DEFAULT_MAX_CALLS_PER_DAY = 200
+DEFAULT_SESSION = "default"
+ANSWER_KEYS = ("response", "result", "text", "output", "content", "message", "answer")
+# A fresh `agy -p` process re-does auth + model/quota init (~5s) on every call. A long-lived
+# `--input-format stream-json` process serves one conversation and answers warm turns in ~1.5s.
+DEFAULT_WORKER_IDLE_SEC = 900.0
+# One Codex thread spawns one MCP server; scope sessions per server instance so two threads
+# never fight over the same Antigravity conversation. A fresh instance adopts the previous
+# instance's map unless another instance still looks alive.
+INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000)}"
+DEFAULT_ADOPT_WINDOW_SEC = 120.0
+DEFAULT_LONG_CONTEXT_TOKENS = 100000
+HANDOFF_PROMPT = (
+    "把以上这次对话压缩成一份交接摘要，供另一段全新会话接手使用。要求：\n"
+    "1) 保留目标、已得出的结论、关键决策与理由、未完成事项、涉及的文件或路径、必须遵守的约束；\n"
+    "2) 只写事实与结论，不要客套；\n"
+    "3) 控制在 400 字以内；\n"
+    "4) 只输出摘要本身，不要输出任何前言后记。"
+)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+MIN_INTERVAL_SEC = _env_float("AGY_MCP_MIN_INTERVAL_SEC", DEFAULT_MIN_INTERVAL_SEC)
+MAX_CALLS_PER_DAY = _env_int("AGY_MCP_MAX_CALLS_PER_DAY", DEFAULT_MAX_CALLS_PER_DAY)
+
+
+class FileLock:
+    """Cross-process advisory lock so parallel clients queue instead of racing."""
+
+    def __init__(self, path: str, timeout: float) -> None:
+        self.path = path
+        self.timeout = timeout
+        self.handle = None
+
+    def __enter__(self) -> "FileLock":
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.handle = open(self.path, "a+b")
+        if self.handle.tell() == 0:
+            self.handle.write(b"0")
+            self.handle.flush()
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self.handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("another Antigravity call is still running")
+                time.sleep(0.5)
+
+    def __exit__(self, *exc_info: Any) -> None:
+        try:
+            if self.handle is not None:
+                self.handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            if self.handle is not None:
+                self.handle.close()
+                self.handle = None
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def read_state() -> Dict[str, Any]:
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        if not isinstance(state, dict):
+            return {}
+        return state
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(state: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False)
+    except OSError as exc:
+        log(f"could not persist guard state: {exc}")
+
+
+def calls_today(state: Dict[str, Any]) -> int:
+    if state.get("day") != _today():
+        return 0
+    try:
+        return int(state.get("calls", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def log_usage(entry: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(USAGE_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log(f"could not append usage log: {exc}")
+
+
+def _read_store() -> Dict[str, Any]:
+    try:
+        with open(SESSIONS_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"instances": {}}
+    if not isinstance(data, dict):
+        return {"instances": {}}
+    if isinstance(data.get("instances"), dict):
+        return data
+    # Legacy flat store: expose it as an adoptable instance.
+    return {"instances": {"legacy": {"sessions": data, "last_seen": 0.0}}}
+
+
+def read_sessions() -> Dict[str, Any]:
+    """Session map for THIS MCP server instance (= one Codex conversation)."""
+    instances = _read_store().get("instances") or {}
+    mine = instances.get(INSTANCE_ID)
+    if isinstance(mine, dict):
+        sessions = mine.get("sessions")
+        return sessions if isinstance(sessions, dict) else {}
+    others = [
+        (iid, data)
+        for iid, data in instances.items()
+        if isinstance(data, dict) and iid != INSTANCE_ID
+    ]
+    now = time.time()
+    alive = [iid for iid, data in others if now - float(data.get("last_seen") or 0) <= ADOPT_WINDOW_SEC]
+    if alive:
+        return {}  # a parallel Codex thread is active: give this one its own conversation
+    if others:
+        best = max(others, key=lambda kv: float(kv[1].get("last_seen") or 0))
+        sessions = best[1].get("sessions")
+        return dict(sessions) if isinstance(sessions, dict) else {}
+    return {}
+
+
+def write_sessions(sessions: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        store = _read_store()
+        instances = store.setdefault("instances", {})
+        now = time.time()
+        for iid in [
+            iid
+            for iid, data in list(instances.items())
+            if isinstance(data, dict) and now - float(data.get("last_seen") or 0) > 7 * 86400
+        ]:
+            instances.pop(iid, None)
+        instances[INSTANCE_ID] = {"sessions": sessions, "last_seen": now}
+        with open(SESSIONS_PATH, "w", encoding="utf-8") as handle:
+            json.dump(store, handle, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        log(f"could not persist sessions: {exc}")
+
+
+def read_last_conversations() -> Dict[str, str]:
+    """workspace path -> conversation id, as tracked by the Antigravity CLI."""
+    try:
+        path = os.path.join(AGY_CLI_HOME, "cache", "last_conversations.json")
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return {str(key): str(value) for key, value in data.items()}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def newest_conversation_since(since_ts: float) -> Optional[str]:
+    """Fallback capture: newest conversation store touched during our call window."""
+    conv_dir = os.path.join(AGY_CLI_HOME, "conversations")
+    try:
+        names = os.listdir(conv_dir)
+    except OSError:
+        return None
+    newest: Optional[str] = None
+    newest_mtime = 0.0
+    for name in names:
+        if not name.endswith(".db"):
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(conv_dir, name))
+        except OSError:
+            continue
+        if mtime >= since_ts - 3 and mtime > newest_mtime:
+            newest_mtime = mtime
+            newest = name[: -len(".db")]
+    return newest
+
+
+def parse_json_output(text: str) -> Optional[Dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    payload = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        else:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def extract_answer(node: Any, depth: int = 0) -> Optional[str]:
+    """Pull the answer out of the CLI result without grabbing unrelated metadata.
+
+    The result payload is `{conversation_id, status, response, ...}`; never fall back to
+    "any string anywhere", or a metadata id gets returned as the answer.
+    """
+    if depth > 4 or node is None:
+        return None
+    if isinstance(node, str):
+        return node.strip() or None
+    if isinstance(node, dict):
+        for key in ANSWER_KEYS:
+            if key in node:
+                found = extract_answer(node[key], depth + 1)
+                if found:
+                    return found
+        return None
+    if isinstance(node, list):
+        parts = [extract_answer(item, depth + 1) for item in node]
+        joined = "\n".join(part for part in parts if part)
+        return joined or None
+    return None
+
+
+def merge_usage(target: Dict[str, Any], payload: Optional[Dict[str, Any]]) -> None:
+    """Fold a turn's token usage into a running total (handoff runs two turns)."""
+    if not payload:
+        return
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return
+    for key, value in usage.items():
+        if isinstance(value, (int, float)):
+            target[key] = int(target.get(key, 0) or 0) + int(value)
+
+
+def seed_prompt(prompt: str, digest: Optional[str]) -> str:
+    """Handoff: start a fresh conversation that has read a digest of the previous one."""
+    if not digest:
+        return prompt
+    return (
+        "前情提要（上一段 Antigravity 会话的交接摘要）：\n"
+        f"{digest.strip()}\n\n"
+        "以上是背景。请在此基础上继续完成下面的任务：\n\n"
+        f"{prompt}"
+    )
+
+
+def mask_proxy(value: str) -> str:
+    """Hide credentials in a proxy URL before showing it back to the model."""
+    if "@" in value:
+        scheme, _, rest = value.partition("://")
+        return f"{scheme}://***@{rest.rpartition('@')[2]}" if scheme else f"***@{value.rpartition('@')[2]}"
+    return value
+
+
+def proxy_env_report() -> Dict[str, Any]:
+    report: Dict[str, Any] = {}
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        value = os.environ.get(key)
+        if value:
+            report[key] = mask_proxy(value) if "PROXY" in key.upper() and "NO_PROXY" not in key.upper() else value
+    return report
+
+
+def log(message: str) -> None:
+    sys.stderr.write(f"[agy-mcp] {message}\n")
+    sys.stderr.flush()
+
+
+def resolve_agy() -> str:
+    """Locate the agy executable: env override, PATH, then known install dirs."""
+    override = os.environ.get("AGY_BIN")
+    if override and os.path.exists(override):
+        return override
+
+    found = shutil.which("agy") or shutil.which("agy.exe")
+    if found:
+        return found
+
+    exe = "agy.exe" if os.name == "nt" else "agy"
+    candidates = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(os.path.join(local_app_data, "agy", "bin", exe))
+    candidates.append(os.path.join(os.path.expanduser("~"), ".local", "bin", exe))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "agy executable not found; install the Antigravity CLI or set AGY_BIN"
+    )
+
+
+def run_agy(
+    argv: List[str],
+    cwd: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> Tuple[int, str, str]:
+    """Run one `agy` invocation, cleaning up the whole process group on timeout."""
+    exe = resolve_agy()
+    popen_kwargs: Dict[str, Any] = {}
+    if os.name != "nt":
+        # Own process group so a timed-out run can be killed together with its helpers.
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        [exe] + argv,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=CREATE_NO_WINDOW,
+        encoding="utf-8",
+        errors="replace",
+        **popen_kwargs,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise
+    return proc.returncode, out or "", err or ""
+
+
+def text_result(text: str, is_error: bool = False, notes: Optional[List[str]] = None) -> Dict[str, Any]:
+    content = [{"type": "text", "text": text}]
+    for note in notes or []:
+        content.append({"type": "text", "text": f"[agy-mcp] {note}"})
+    return {"content": content, "isError": is_error}
+
+
+def join_streams(code: int, out: str, err: str) -> str:
+    body = out.strip()
+    err = err.strip()
+    if not body and err:
+        body = err
+    elif err:
+        body = f"{body}\n\n[stderr]\n{err}"
+    if code != 0 and not body:
+        body = f"agy exited with code {code}"
+    return body
+
+
+def kill_process_tree(proc: subprocess.Popen) -> None:
+    """agy spawns helper processes; make sure a stopped worker leaves none behind."""
+    try:
+        if proc.poll() is not None:
+            return
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=15,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+class Worker:
+    """A long-lived `agy --input-format stream-json` process bound to one conversation."""
+
+    def __init__(self, key: str, argv: List[str], workspace: str) -> None:
+        self.key = key
+        self.argv = argv
+        self.workspace = workspace
+        self.proc: Optional[subprocess.Popen] = None
+        self.events: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue()
+        self.stderr_tail: List[str] = []
+        self.conversation_id: Optional[str] = None
+        self.last_used = time.time()
+        self.turns = 0
+
+    def start(self) -> None:
+        exe = resolve_agy()
+        popen_kwargs: Dict[str, Any] = {}
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        self.proc = subprocess.Popen(
+            [exe] + self.argv,
+            cwd=self.workspace,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=CREATE_NO_WINDOW,
+            **popen_kwargs,
+        )
+        threading.Thread(target=self._pump, args=(self.proc.stdout, "out"), daemon=True).start()
+        threading.Thread(target=self._pump, args=(self.proc.stderr, "err"), daemon=True).start()
+
+    def _pump(self, stream: Any, tag: str) -> None:
+        try:
+            for line in stream:
+                self.events.put((tag, line))
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.events.put((tag + "-eof", None))
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def send(self, prompt: str, timeout: float) -> Dict[str, Any]:
+        if not self.alive() or self.proc is None or self.proc.stdin is None:
+            raise RuntimeError("agy stream process is not running")
+
+        while not self.events.empty():  # drop anything left over from a previous turn
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                break
+
+        message = {"event": "user", "message": {"content": prompt}}
+        self.proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no result within {int(timeout)}s")
+            try:
+                tag, line = self.events.get(timeout=min(remaining, 5.0))
+            except queue.Empty:
+                if not self.alive():
+                    tail = self.stderr_tail[-1] if self.stderr_tail else "no stderr output"
+                    raise RuntimeError(f"agy stream process exited: {tail}")
+                continue
+            if tag == "err":
+                if line:
+                    self.stderr_tail.append(line.strip())
+                    del self.stderr_tail[:-20]
+                continue
+            if tag.endswith("-eof") or not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("conversation_id"):
+                self.conversation_id = str(event["conversation_id"])
+            if event.get("event") == "result":
+                result = event.get("result")
+                if isinstance(result, dict):
+                    if result.get("conversation_id"):
+                        self.conversation_id = str(result["conversation_id"])
+                    self.last_used = time.time()
+                    self.turns += 1
+                    return result
+
+    def stop(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            kill_process_tree(proc)
+
+
+WORKERS: Dict[str, Worker] = {}
+WORKER_IDLE_SEC = _env_float("AGY_MCP_WORKER_IDLE_SEC", DEFAULT_WORKER_IDLE_SEC)
+ADOPT_WINDOW_SEC = _env_float("AGY_MCP_INSTANCE_WINDOW_SEC", DEFAULT_ADOPT_WINDOW_SEC)
+LONG_CONTEXT_TOKENS = _env_int("AGY_MCP_LONG_CONTEXT_TOKENS", DEFAULT_LONG_CONTEXT_TOKENS)
+
+
+def reap_workers() -> None:
+    now = time.time()
+    for key in list(WORKERS):
+        worker = WORKERS[key]
+        idle = WORKER_IDLE_SEC > 0 and now - worker.last_used > WORKER_IDLE_SEC
+        if not worker.alive() or idle:
+            worker.stop()
+            WORKERS.pop(key, None)
+
+
+def shutdown_workers() -> None:
+    for worker in list(WORKERS.values()):
+        worker.stop()
+    WORKERS.clear()
+
+
+atexit.register(shutdown_workers)
+
+
+def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_recent: bool) -> List[str]:
+    """Flags that must hold for the life of a session process."""
+    flags: List[str] = []
+    if args.get("model"):
+        flags += ["--model", str(args["model"])]
+    if args.get("effort"):
+        flags += ["--effort", str(args["effort"])]
+    if args.get("agent"):
+        flags += ["--agent", str(args["agent"])]
+    if args.get("mode"):
+        flags += ["--mode", str(args["mode"])]
+    if conversation:
+        flags += ["--conversation", conversation]
+    elif continue_recent:
+        flags.append("-c")
+    if args.get("sandbox", True):
+        flags.append("--sandbox")
+    if args.get("skip_permissions", False):
+        flags.append("--dangerously-skip-permissions")
+    if args.get("disable_slash_commands", True):
+        flags.append("--disable-slash-commands")
+    extra = args.get("extra_args")
+    if isinstance(extra, list):
+        flags += [str(item) for item in extra]
+    return flags
+
+
+ASK_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "prompt": {
+            "type": "string",
+            "description": "Prompt sent to the Antigravity CLI in non-interactive print mode.",
+        },
+        "model": {"type": "string", "description": "Optional Antigravity model id."},
+        "effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Reasoning effort for this Antigravity session.",
+        },
+        "cwd": {
+            "type": "string",
+            "description": "Working directory of the Antigravity session (its workspace).",
+        },
+        "session": {
+            "type": "string",
+            "default": DEFAULT_SESSION,
+            "description": (
+                "Named Antigravity conversation to keep continuity across calls. Calls with the "
+                "same session name resume the same conversation; use new_session to restart it."
+            ),
+        },
+        "new_session": {
+            "type": "boolean",
+            "default": False,
+            "description": "Start a fresh conversation for this session instead of resuming the stored one.",
+        },
+        "handoff": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Compact the current conversation into a handoff digest, start a NEW conversation and "
+                "answer there with that digest as background. Use when the conversation has grown long."
+            ),
+        },
+        "agent": {"type": "string", "description": "Optional Antigravity agent name."},
+        "mode": {
+            "type": "string",
+            "enum": ["plan", "accept-edits"],
+            "description": "Antigravity execution mode; omit to use the CLI default.",
+        },
+        "sandbox": {
+            "type": "boolean",
+            "default": True,
+            "description": "Run the session with terminal restrictions enabled (default true).",
+        },
+        "skip_permissions": {
+            "type": "boolean",
+            "default": False,
+            "description": "Auto-approve Antigravity tool permission prompts (default false).",
+        },
+        "continue_session": {
+            "type": "boolean",
+            "default": False,
+            "description": "Continue the most recent Antigravity conversation.",
+        },
+        "conversation": {
+            "type": "string",
+            "description": "Resume a specific Antigravity conversation id (overrides the stored session).",
+        },
+        "output_format": {
+            "type": "string",
+            "enum": ["text", "json"],
+            "default": "text",
+            "description": "CLI print-mode output format returned verbatim.",
+        },
+        "disable_slash_commands": {
+            "type": "boolean",
+            "default": True,
+            "description": "Do not expand slash commands or skills in the prompt (default true).",
+        },
+        "timeout_sec": {
+            "type": "number",
+            "default": DEFAULT_TIMEOUT_SEC,
+            "description": "Maximum seconds to wait for the Antigravity CLI.",
+        },
+        "extra_args": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Extra raw agy flags appended verbatim.",
+        },
+    },
+    "required": ["prompt"],
+    "additionalProperties": False,
+}
+
+TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "antigravity_ask",
+        "description": (
+            "Run one non-interactive prompt through the local Antigravity CLI (agy) and "
+            "return its answer. Uses the Google account already signed in to agy, so it "
+            "consumes that Antigravity/Gemini quota instead of the current provider."
+        ),
+        "inputSchema": ASK_SCHEMA,
+    },
+    {
+        "name": "antigravity_models",
+        "description": "List the Antigravity models available to the signed-in agy account.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "antigravity_agents",
+        "description": "List the Antigravity agents defined for the signed-in agy account.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "antigravity_sessions",
+        "description": (
+            "List or forget the Antigravity conversations this server has been tracking, "
+            "together with the conversations the CLI knows about locally."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "forget"],
+                    "default": "list",
+                    "description": "list tracked sessions, or forget one (session) / all ('*').",
+                },
+                "session": {
+                    "type": "string",
+                    "description": "Session name for action=forget; '*' clears every tracked session.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "antigravity_quota",
+        "description": (
+            "Show remaining Antigravity quota (weekly and 5-hour windows per model group). "
+            "Answered by the CLI itself: starts no turn and spends no quota."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "antigravity_status",
+        "description": (
+            "Report the resolved agy path, CLI version, working directory and whether the "
+            "account can list models (a sign-in probe). Use this to diagnose failures."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+]
+
+
+def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = args.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return text_result("antigravity_ask requires a non-empty 'prompt' string.", True)
+
+    workspace = os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd())
+    if not os.path.isdir(workspace):
+        return text_result(f"cwd does not exist: {workspace}", True)
+
+    session_name = str(args.get("session") or DEFAULT_SESSION).strip() or DEFAULT_SESSION
+    new_session = bool(args.get("new_session", False))
+    continue_recent = bool(args.get("continue_session", False))
+    handoff = bool(args.get("handoff", False))
+    explicit_conversation = str(args["conversation"]).strip() if args.get("conversation") else None
+
+    sessions = read_sessions()
+    entry = sessions.get(session_name)
+    entry = entry if isinstance(entry, dict) else {}
+    notes: List[str] = []
+    resumed = False
+
+    conversation = explicit_conversation
+    if conversation is None and not new_session and not continue_recent:
+        stored = entry.get("conversation_id")
+        stored_workspace = entry.get("workspace")
+        if stored and stored_workspace == workspace:
+            conversation = str(stored)
+            resumed = True
+        elif stored:
+            notes.append(
+                f'session "{session_name}" belongs to {stored_workspace}; '
+                f"started a new Antigravity conversation in {workspace}"
+            )
+
+    flags = session_flags(args, conversation, continue_recent)
+    requested_format = str(args.get("output_format") or "text")
+    transport = str(os.environ.get("AGY_MCP_TRANSPORT") or "stream").strip().lower()
+
+    timeout_sec = args.get("timeout_sec") or DEFAULT_TIMEOUT_SEC
+    try:
+        timeout_sec = float(timeout_sec)
+    except (TypeError, ValueError):
+        return text_result("timeout_sec must be a number.", True)
+    if timeout_sec <= 0:
+        return text_result("timeout_sec must be greater than zero.", True)
+
+    payload: Optional[Dict[str, Any]] = None
+    captured: Optional[str] = None
+    status_value: Any = None
+    usage_tokens: Dict[str, Any] = {}
+    denied: List[str] = []
+    out = ""
+    err = ""
+    code = 0
+    worker: Optional[Worker] = None
+
+    try:
+        with FileLock(LOCK_PATH, LOCK_WAIT_SEC):
+            state = read_state()
+            used = calls_today(state)
+            if MAX_CALLS_PER_DAY and used >= MAX_CALLS_PER_DAY:
+                return text_result(
+                    f"Daily Antigravity cap reached ({used}/{MAX_CALLS_PER_DAY}). "
+                    "Raise AGY_MCP_MAX_CALLS_PER_DAY (0 disables the cap) if this volume is intended.",
+                    True,
+                )
+            last = state.get("last_call_ts")
+            if MIN_INTERVAL_SEC > 0 and isinstance(last, (int, float)):
+                gap = MIN_INTERVAL_SEC - (time.time() - last)
+                if gap > 0:
+                    time.sleep(gap)
+
+            before_map = read_last_conversations()
+            reap_workers()
+            started = time.time()
+
+            if transport == "stream":
+                # The worker holds the live conversation, so the conversation id must NOT be part
+                # of the key: otherwise the first follow-up call would cold-start a second process.
+                base_flags = session_flags(args, None, continue_recent)
+                key = f"{session_name}|{workspace}|{' '.join(base_flags)}"
+                for stale in [k for k in WORKERS if k.startswith(f"{session_name}|{workspace}|") and k != key]:
+                    WORKERS.pop(stale).stop()
+                worker = WORKERS.get(key)
+                if worker is not None and not worker.alive():
+                    worker.stop()
+                    WORKERS.pop(key, None)
+                    worker = None
+
+                stream_args = ["--input-format", "stream-json", "--output-format", "stream-json"]
+                digest: Optional[str] = None
+                if handoff and (worker is not None or conversation):
+                    if worker is None:
+                        worker = Worker(
+                            key,
+                            stream_args + session_flags(args, conversation, False),
+                            workspace,
+                        )
+                        worker.start()
+                        WORKERS[key] = worker
+                    digest_payload = worker.send(HANDOFF_PROMPT, timeout_sec + TIMEOUT_GRACE_SEC)
+                    digest = extract_answer(digest_payload) or ""
+                    merge_usage(usage_tokens, digest_payload)
+                    worker.stop()
+                    WORKERS.pop(key, None)
+                    worker = None
+                    conversation = None  # the real turn must land in a brand-new conversation
+                    if digest:
+                        notes.append("handoff: carried a digest of the previous conversation into a new one")
+
+                if worker is None:
+                    start_flags = (
+                        session_flags(args, conversation, continue_recent)
+                        if (conversation and not handoff)
+                        else session_flags(args, None, False)
+                        if handoff
+                        else base_flags
+                    )
+                    worker = Worker(
+                        key,
+                        stream_args + start_flags,
+                        workspace,
+                    )
+                    worker.start()
+                    WORKERS[key] = worker
+                    notes.append(
+                        "started a long-lived Antigravity session process; later calls reuse it "
+                        "(set AGY_MCP_TRANSPORT=oneshot to force one process per call)"
+                    )
+                payload = worker.send(seed_prompt(prompt, digest), timeout_sec + TIMEOUT_GRACE_SEC)
+            else:
+                digest = None
+                if handoff and conversation:
+                    digest_argv = (
+                        ["-p", HANDOFF_PROMPT]
+                        + session_flags(args, conversation, False)
+                        + [f"--print-timeout", f"{int(timeout_sec)}s", "--output-format", "json"]
+                    )
+                    _, digest_out, _ = run_agy(
+                        digest_argv, cwd=workspace, timeout=timeout_sec + TIMEOUT_GRACE_SEC
+                    )
+                    digest_payload = parse_json_output(digest_out)
+                    digest = extract_answer(digest_payload) if digest_payload else None
+                    merge_usage(usage_tokens, digest_payload)
+                    conversation = None
+                    if digest:
+                        notes.append("handoff: carried a digest of the previous conversation into a new one")
+                send_flags = session_flags(args, None, False) if handoff else flags
+                argv = ["-p", seed_prompt(prompt, digest)] + send_flags
+                argv += ["--print-timeout", f"{int(timeout_sec)}s", "--output-format", "json"]
+                code, out, err = run_agy(argv, cwd=workspace, timeout=timeout_sec + TIMEOUT_GRACE_SEC)
+                payload = parse_json_output(out)
+
+            duration_ms = int((time.time() - started) * 1000)
+
+            if payload:
+                raw_id = payload.get("conversation_id") or payload.get("conversationId")
+                if isinstance(raw_id, str) and raw_id.strip():
+                    captured = raw_id.strip()
+                status_value = payload.get("status")
+                usage = payload.get("usage")
+                if isinstance(usage, dict):
+                    usage_tokens = {
+                        key: value for key, value in usage.items() if isinstance(value, (int, float))
+                    }
+                raw_denied = payload.get("denied_actions")
+                if isinstance(raw_denied, list):
+                    for item in raw_denied:
+                        if isinstance(item, dict):
+                            denied.append(str(item.get("display_name") or item.get("action") or "unknown"))
+                        elif isinstance(item, str):
+                            denied.append(item)
+
+            succeeded = (
+                code == 0
+                and payload is not None
+                and str(status_value or "SUCCESS").upper() in ("SUCCESS", "OK")
+            )
+
+            if succeeded and captured is None:
+                workspace_key = workspace
+                after_map = read_last_conversations()
+                if after_map.get(workspace_key) and after_map.get(workspace_key) != before_map.get(workspace_key):
+                    captured = after_map[workspace_key]
+                else:
+                    captured = newest_conversation_since(started)
+            if succeeded and captured is None and conversation is None:
+                notes.append(
+                    "could not capture the Antigravity conversation id; "
+                    "the next call in this session will start a fresh conversation"
+                )
+
+            if succeeded and captured:
+                previous = entry.get("conversation_id")
+                current_input = int(usage_tokens.get("input_tokens", 0) or 0)
+                if (
+                    not handoff
+                    and LONG_CONTEXT_TOKENS > 0
+                    and current_input >= LONG_CONTEXT_TOKENS
+                    and int(entry.get("last_input_tokens", 0) or 0) < LONG_CONTEXT_TOKENS
+                ):
+                    notes.append(
+                        f"this Antigravity conversation now resends about {current_input} input tokens per "
+                        f"turn (turn {payload.get('num_turns') if payload else '?'}); consider "
+                        "handoff: true to compact it into a fresh conversation, or new_session: true to "
+                        "drop the history"
+                    )
+                sessions[session_name] = {
+                    "conversation_id": captured,
+                    "workspace": workspace,
+                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "calls": int(entry.get("calls", 0) or 0) + 1 if previous == captured else 1,
+                    "num_turns": payload.get("num_turns") if payload else None,
+                    "last_model": args.get("model") or (payload.get("model") if payload else None),
+                    "last_input_tokens": current_input,
+                }
+                write_sessions(sessions)
+
+            same_day = state.get("day") == _today()
+            write_state(
+                {
+                    "day": _today(),
+                    "calls": used + (1 if succeeded else 0),
+                    "last_call_ts": time.time(),
+                    "total_tokens": (int(state.get("total_tokens", 0) or 0) if same_day else 0)
+                    + int(usage_tokens.get("total_tokens", 0) or 0),
+                    "input_tokens": (int(state.get("input_tokens", 0) or 0) if same_day else 0)
+                    + int(usage_tokens.get("input_tokens", 0) or 0),
+                    "output_tokens": (int(state.get("output_tokens", 0) or 0) if same_day else 0)
+                    + int(usage_tokens.get("output_tokens", 0) or 0),
+                }
+            )
+            log_usage(
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "tool": "antigravity_ask",
+                    "transport": transport,
+                    "session": session_name,
+                    "conversation": captured,
+                    "resumed": resumed,
+                    "model": args.get("model"),
+                    "cwd": workspace,
+                    "prompt_chars": len(prompt),
+                    "duration_ms": duration_ms,
+                    "exit_code": code,
+                    "status": status_value,
+                    "ok": succeeded,
+                    "denied_actions": denied,
+                    "usage": usage_tokens,
+                }
+            )
+    except TimeoutError as exc:
+        if worker is not None:
+            worker.stop()
+            WORKERS.pop(worker.key, None)
+        return text_result(f"Antigravity is busy: {exc}", True)
+    except RuntimeError as exc:
+        if worker is not None:
+            worker.stop()
+            WORKERS.pop(worker.key, None)
+        return text_result(f"Antigravity session failed: {exc}", True)
+    except subprocess.TimeoutExpired:
+        return text_result(f"agy did not finish within {int(timeout_sec) + TIMEOUT_GRACE_SEC}s.", True)
+    except FileNotFoundError as exc:
+        return text_result(str(exc), True)
+
+    if denied:
+        notes.append(
+            "the sandbox denied these Antigravity tool permissions: "
+            + ", ".join(denied)
+            + ". Pass skip_permissions=true (or add an allow rule) if the answer needs them."
+        )
+    if code != 0:
+        return text_result(join_streams(code, out, err), True, notes)
+    if payload is None:
+        return text_result(join_streams(code, out, err), False, notes)
+    if status_value is not None and str(status_value).upper() not in ("SUCCESS", "OK"):
+        detail = payload.get("error") or join_streams(code, out, err)
+        return text_result(f"Antigravity reported status {status_value}: {detail}", True, notes)
+
+    answer = extract_answer(payload)
+    if not answer and denied:
+        return text_result(
+            "Antigravity produced no answer because the sandbox denied the tool it needed.", True, notes
+        )
+    if requested_format == "json":
+        return text_result(json.dumps(payload, ensure_ascii=False), False, notes)
+    return text_result(answer if answer else out.strip(), False, notes)
+
+
+def tool_simple(argv: List[str], label: str) -> Dict[str, Any]:
+    try:
+        code, out, err = run_agy(argv, timeout=DEFAULT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        return text_result(f"agy {label} timed out.", True)
+    except FileNotFoundError as exc:
+        return text_result(str(exc), True)
+    return text_result(join_streams(code, out, err), code != 0)
+
+
+QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
+QUOTA_CACHE_TTL = _env_float("AGY_MCP_QUOTA_CACHE_SEC", 60.0)
+
+
+def read_quota() -> Dict[str, Any]:
+    """`-p "/quota"` is answered by the CLI itself: no turn, no quota spent, no conversation."""
+    if QUOTA_CACHE.get("payload") and (time.time() - float(QUOTA_CACHE.get("ts") or 0)) < QUOTA_CACHE_TTL:
+        return QUOTA_CACHE["payload"]
+    code, out, err = run_agy(["-p", "/quota", "--output-format", "json"], timeout=90)
+    payload = parse_json_output(out)
+    if payload:
+        QUOTA_CACHE["ts"] = time.time()
+        QUOTA_CACHE["payload"] = payload
+    else:
+        payload = {"status": "ERROR", "error": join_streams(code, out, err)}
+    return payload
+
+
+def tool_quota(args: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        payload = read_quota()
+    except subprocess.TimeoutExpired:
+        return text_result("agy /quota timed out.", True)
+    except FileNotFoundError as exc:
+        return text_result(str(exc), True)
+
+    command = payload.get("command")
+    groups: List[Dict[str, Any]] = []
+    if isinstance(command, dict):
+        data = command.get("data")
+        if isinstance(data, dict) and isinstance(data.get("groups"), list):
+            for group in data["groups"]:
+                if not isinstance(group, dict):
+                    continue
+                buckets = []
+                for bucket in group.get("buckets") or []:
+                    if not isinstance(bucket, dict):
+                        continue
+                    fraction = bucket.get("remaining_fraction")
+                    buckets.append(
+                        {
+                            "id": bucket.get("id"),
+                            "name": bucket.get("name"),
+                            "remaining_percent": round(float(fraction) * 100, 1)
+                            if isinstance(fraction, (int, float))
+                            else None,
+                            "reset_time": bucket.get("reset_time"),
+                        }
+                    )
+                groups.append({"group": group.get("name"), "buckets": buckets})
+
+    report = {
+        "table": (payload.get("response") or "").strip(),
+        "groups": groups,
+        "cached_for_sec": QUOTA_CACHE_TTL,
+        "note": "answered by the CLI itself; no turn ran and no quota was spent",
+    }
+    ok = bool(groups) or bool(report["table"])
+    return text_result(json.dumps(report, ensure_ascii=False, indent=2), not ok)
+
+
+def tool_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    report: Dict[str, Any] = {"cwd": os.getcwd(), "python": sys.version.split()[0]}
+    state = read_state()
+    report["guard"] = {
+        "min_interval_sec": MIN_INTERVAL_SEC,
+        "max_calls_per_day": MAX_CALLS_PER_DAY or "unlimited",
+        "calls_today": calls_today(state),
+        "tokens_today": {
+            "total": int(state.get("total_tokens", 0) or 0) if state.get("day") == _today() else 0,
+            "input": int(state.get("input_tokens", 0) or 0) if state.get("day") == _today() else 0,
+            "output": int(state.get("output_tokens", 0) or 0) if state.get("day") == _today() else 0,
+        },
+        "usage_log": USAGE_PATH,
+    }
+    report["proxy"] = proxy_env_report() or "(no proxy env visible to this server)"
+    report["agy_cli_home"] = AGY_CLI_HOME
+    reap_workers()
+    report["workers"] = {
+        "transport": str(os.environ.get("AGY_MCP_TRANSPORT") or "stream"),
+        "idle_reap_sec": WORKER_IDLE_SEC,
+        "active": [
+            {"session": key.split("|")[0], "workspace": key.split("|")[1], "turns": worker.turns}
+            for key, worker in WORKERS.items()
+        ],
+    }
+    report["sessions"] = {
+        "tracked": sorted(read_sessions()),
+        "default": DEFAULT_SESSION,
+        "store": SESSIONS_PATH,
+    }
+    try:
+        report["agy_path"] = resolve_agy()
+    except FileNotFoundError as exc:
+        report["agy_path"] = None
+        report["error"] = str(exc)
+        return text_result(json.dumps(report, ensure_ascii=False, indent=2), True)
+
+    code, out, err = run_agy(["--version"], timeout=60)
+    report["version"] = (out or err).strip()
+    report["version_exit_code"] = code
+
+    code, out, err = run_agy(["models"], timeout=DEFAULT_TIMEOUT_SEC)
+    report["models_exit_code"] = code
+    report["models_output"] = (out or err).strip()[:2000]
+    report["signed_in"] = code == 0
+    return text_result(json.dumps(report, ensure_ascii=False, indent=2), code != 0)
+
+
+def tool_sessions(args: Dict[str, Any]) -> Dict[str, Any]:
+    action = str(args.get("action") or "list").lower()
+    name = args.get("session")
+
+    if action == "forget":
+        sessions = read_sessions()
+        target = str(name or "").strip()
+        if not target:
+            return text_result("action=forget needs a 'session' name (use '*' to clear all).", True)
+        if target == "*":
+            forgotten = sorted(sessions)
+            write_sessions({})
+        elif target in sessions:
+            forgotten = [target]
+            sessions.pop(target, None)
+            write_sessions(sessions)
+        else:
+            return text_result(f"no tracked session named '{target}'.", True)
+        return text_result(f"forgot: {', '.join(forgotten)}")
+
+    sessions = read_sessions()
+    tracked = []
+    for session_name in sorted(sessions):
+        entry = sessions[session_name]
+        if not isinstance(entry, dict):
+            continue
+        tracked.append(
+            {
+                "session": session_name,
+                "conversation_id": entry.get("conversation_id"),
+                "workspace": entry.get("workspace"),
+                "calls": entry.get("calls"),
+                "num_turns": entry.get("num_turns"),
+                "updated": entry.get("updated"),
+            }
+        )
+
+    recent = []
+    conversations_dir = os.path.join(AGY_CLI_HOME, "conversations")
+    try:
+        names = [n for n in os.listdir(conversations_dir) if n.endswith(".db")]
+    except OSError:
+        names = []
+    entries = []
+    for name_only in names:
+        path = os.path.join(conversations_dir, name_only)
+        try:
+            entries.append((os.path.getmtime(path), name_only[: -len(".db")]))
+        except OSError:
+            continue
+    for mtime, conversation_id in sorted(entries, reverse=True)[:10]:
+        recent.append(
+            {
+                "conversation_id": conversation_id,
+                "last_modified": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mtime)),
+            }
+        )
+
+    report = {
+        "tracked_sessions": tracked,
+        "cli_conversations": recent,
+        "workspace_index": read_last_conversations(),
+        "store": SESSIONS_PATH,
+    }
+    return text_result(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+HANDLERS = {
+    "antigravity_ask": tool_ask,
+    "antigravity_models": lambda args: tool_simple(["models"], "models"),
+    "antigravity_agents": lambda args: tool_simple(["agent"], "agent"),
+    "antigravity_sessions": tool_sessions,
+    "antigravity_quota": tool_quota,
+    "antigravity_status": tool_status,
+}
+
+
+def handle_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    method = message.get("method")
+    request_id = message.get("id")
+
+    if method == "initialize":
+        params = message.get("params") or {}
+        requested = params.get("protocolVersion")
+        protocol = requested if requested in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL
+        return {
+            "protocolVersion": protocol,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        }
+    if method in ("notifications/initialized", "initialized"):
+        return None
+    if method == "ping":
+        return {}
+    if method == "tools/list":
+        return {"tools": TOOLS}
+    if method == "tools/call":
+        params = message.get("params") or {}
+        name = params.get("name")
+        handler = HANDLERS.get(str(name))
+        if handler is None:
+            return text_result(f"Unknown tool: {name}", True)
+        args = params.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        try:
+            return handler(args)
+        except Exception as exc:  # keep the server alive on tool errors
+            log(f"tool {name} failed: {exc!r}")
+            return text_result(f"{name} failed: {exc}", True)
+    if method == "resources/list":
+        return {"resources": []}
+    if method == "resources/templates/list":
+        return {"resourceTemplates": []}
+    if method == "prompts/list":
+        return {"prompts": []}
+    if method == "logging/setLevel":
+        return {}
+
+    if request_id is None:
+        return None
+    return None
+
+
+def send(payload: Dict[str, Any]) -> None:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    sys.stdout.buffer.write(data + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def serve() -> int:
+    log(f"serving {SERVER_NAME} {SERVER_VERSION}")
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            log("skipping malformed JSON line")
+            continue
+        if not isinstance(message, dict):
+            continue
+
+        try:
+            result = handle_request(message)
+        except Exception as exc:
+            log(f"handler error: {exc!r}")
+            if message.get("id") is not None:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message.get("id"),
+                        "error": {"code": -32603, "message": f"Internal error: {exc}"},
+                    }
+                )
+            continue
+
+        if message.get("id") is None:
+            continue
+        if result is None:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "error": {"code": -32601, "message": f"Method not found: {message.get('method')}"},
+                }
+            )
+        else:
+            send({"jsonrpc": "2.0", "id": message.get("id"), "result": result})
+    return 0
+
+
+def main(argv: List[str]) -> int:
+    if "--list-tools" in argv:
+        print(json.dumps(TOOLS, ensure_ascii=False, indent=2))
+        return 0
+    if "--status" in argv:
+        print(tool_status({})["content"][0]["text"])
+        return 0
+    return serve()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,303 @@
+# agy-mcp
+
+把本机的 [Antigravity](https://antigravity.google) CLI（`agy`）接成一个 MCP 服务器，
+让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
+回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
+
+- 单文件、纯 Python 标准库、零第三方依赖
+- 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
+- 每个客户端会话复用一个常驻 `agy` 进程：首次调用约 7 秒，之后热轮通常 1~2 秒（视网络而定）
+- 内置会话续接、上下文过长提醒、交接（handoff）、额度查询与调用节流
+
+## 要求
+
+| 项 | 要求 |
+| --- | --- |
+| Python | 3.11 或更高（macOS / Linux 用 `python3`，Windows 用 `python` 或 `py -3`）；3.9 / 3.10 需额外装 `tomli`（仅注册脚本用到） |
+| Antigravity CLI | `agy --version` 有输出 |
+| 网络 | 能访问 Google（中国大陆需要代理，见下） |
+| MCP 客户端 | Codex 默认（`~/.codex/config.toml`）；其它客户端手动接入即可 |
+
+## 安装
+
+```bash
+git clone <this-repo> && cd agy-mcp
+
+# 自检：agy 路径、版本、登录状态、当日调用与 token 用量
+python3 agy_mcp.py --status
+```
+
+### macOS / Linux
+
+1. 定位 CLI：`which agy`；常见位置是 `~/.local/bin/agy`。找不到就显式指定：
+
+   ```bash
+   export AGY_BIN="$HOME/.local/bin/agy"
+   ```
+
+2. 登录一次：终端直接运行 `agy`，走浏览器授权。OAuth token 存在 **macOS 钥匙串**（Linux 走 keyring，
+   不可用时回退到文件），`agy-mcp` 不需要任何凭据配置。
+3. 代理（见下节）。
+
+### Windows
+
+1. 默认安装在 `%LOCALAPPDATA%\agy\bin\agy.exe`，脚本会自动探测。
+2. 登录一次：终端运行 `agy`。OAuth token 存在 **Windows 凭据管理器**。
+3. 代理（见下节）。
+
+## 必须设置代理
+
+`agy` 是 Go 程序，**不读 macOS / Windows 的"系统代理"设置**，只认 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。
+没设代理时的表现很有迷惑性：
+
+```
+dial tcp 172.217.118.4:443: connectex: ... failed to respond
+Error: Please sign in to view available models. Launch the CLI without arguments to sign in.
+```
+
+**这个 "Please sign in" 通常不是没登录，而是连不上 Google**——网络不通时它先超时、再回落到登录提示。
+
+直接验证（能列出模型即通）：
+
+```bash
+# macOS / Linux
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+agy models
+
+# Windows PowerShell
+$env:HTTP_PROXY="http://127.0.0.1:7890"; $env:HTTPS_PROXY="http://127.0.0.1:7890"; agy models
+```
+
+端口按你自己的代理客户端填（Clash 常见 7890/7897，Surge 常见 6152）。注册脚本会把这些变量写进 MCP 条目，
+所以客户端拉起的服务器进程会带上它们，并附加 `NO_PROXY=localhost,127.0.0.1,::1` 避免把本机回环也代理走。
+
+## 注册到客户端
+
+### 方式 A：脚本（推荐）
+
+```bash
+python3 register_agy_mcp.py --proxy http://127.0.0.1:7890
+```
+
+脚本会 upsert `~/.codex/config.toml` 里的 `[mcp_servers.antigravity]`（**写前备份、写前校验 TOML 可解析**），
+幂等可重跑；`--dry-run` 只看改动，`--remove` 卸载，`--clear-env` 清空重置（默认会合并已登记的 env）。
+
+注册后**新开一个客户端会话**（MCP 服务器在会话启动时加载）。
+
+### 方式 B：同时使用 cc-switch
+
+如果 Codex 配置由 [cc-switch](https://github.com/farion1231/cc-switch) 管理，同一条命令会**顺手把这台机器上的
+cc-switch 数据库**（`~/.cc-switch/cc-switch.db` 的 `mcp_servers` 表）也写好——因为 cc-switch 以数据库为准，
+会在切换供应商/模式时把启用项重新投影到 `~/.codex/config.toml`，只手改配置文件会被覆盖。
+检测不到数据库时这一步自动跳过：
+
+```text
+cc-switch DB   : ~/.cc-switch/cc-switch.db -> skipped (no cc-switch DB)
+```
+
+### 方式 C：手写配置
+
+macOS / Linux：
+
+```toml
+[mcp_servers.antigravity]
+type = "stdio"
+command = "python3"
+args = ["/Users/you/agy-mcp/agy_mcp.py"]
+startup_timeout_sec = 30
+tool_timeout_sec = 900
+
+[mcp_servers.antigravity.env]
+AGY_BIN = "/Users/you/.local/bin/agy"
+HTTP_PROXY = "http://127.0.0.1:7890"
+HTTPS_PROXY = "http://127.0.0.1:7890"
+NO_PROXY = "localhost,127.0.0.1,::1"
+```
+
+Windows：
+
+```toml
+[mcp_servers.antigravity]
+type = "stdio"
+command = 'C:\Python312\python.exe'
+args = ['C:\tools\agy-mcp\agy_mcp.py']
+startup_timeout_sec = 30
+tool_timeout_sec = 900
+
+[mcp_servers.antigravity.env]
+AGY_BIN = 'C:\Users\you\AppData\Local\agy\bin\agy.exe'
+HTTP_PROXY = 'http://127.0.0.1:7890'
+HTTPS_PROXY = 'http://127.0.0.1:7890'
+NO_PROXY = 'localhost,127.0.0.1,::1'
+```
+
+> `tool_timeout_sec` 给足：一次 `agy` 调用可能要跑几分钟，别被客户端默认工具超时掐断。
+
+## 提供的工具
+
+| 工具 | 说明 |
+| --- | --- |
+| `antigravity_ask` | 提问 / 下达任务；默认续接同一会话，回答返回纯文本 |
+| `antigravity_quota` | 查看剩余额度（按模型组的周 / 5 小时窗口）；由 CLI 自身回答，**不扣额度** |
+| `antigravity_sessions` | 查看 / 遗忘本服务器跟踪的会话，并列出 CLI 本地已有的会话 |
+| `antigravity_models` | 列出当前账号可用的模型（含可传给 `--model` 的 id） |
+| `antigravity_agents` | 列出可用 agent |
+| `antigravity_status` | 诊断：agy 路径、版本、工作目录、代理可见性、当日调用与 token、登录探测 |
+
+## 会话连续性
+
+默认 `session = "default"`：**同一会话名 + 同一 workspace** 的连续调用续接同一个 Antigravity 会话，
+不会每次新开。
+
+- 每个会话长期驻留一个 `agy` 进程（`--input-format stream-json`），多轮共用：
+  冷启动约 6.9 秒（含鉴权与模型/额度初始化），**热轮约 1.4 秒**；空闲 15 分钟回收。
+- 会话 id 存在 `~/.agy-mcp/sessions.json`；进程被回收或崩溃后，下次调用用 `--conversation <id>` 重新拉起，历史不丢。
+- 会话表按 MCP 服务器实例隔离，因此**一个客户端会话对应一个 agy 会话**；同一线程重启服务器会沿用最近实例，
+  除非检测到另一个实例仍活跃（`AGY_MCP_INSTANCE_WINDOW_SEC`，默认 120 秒）。
+- 想退回"一次调用一个进程"：`AGY_MCP_TRANSPORT=oneshot`。
+
+注意：续接会把该会话历史一起发给模型，**input token 随轮次增长**（一次实测中第二轮 input 从 14k 涨到 28k），
+长会话既费额度也费时间。
+
+## 切换会话与 handoff
+
+人工切换：让客户端带不同的 `session` 名调用即可（`session: "review"` / `session: "writing"`）；
+**不指定就一直是同一个会话**。
+
+上下文过长时会自动提示一次（默认超过 `AGY_MCP_LONG_CONTEXT_TOKENS=100000` input token）：
+
+```
+[agy-mcp] this Antigravity conversation now resends about 105k input tokens per turn (turn 7);
+consider handoff: true to compact it into a fresh conversation, or new_session: true to drop the history
+```
+
+`handoff: true` 是本地实现的"分叉续接"：先在旧会话里要一份 ≤400 字交接摘要，再**新开一个会话**把摘要作为
+前情提要发过去。新会话因此知道前因后果，而每轮重发的历史只剩摘要。
+
+> Antigravity CLI 自身的 `/fork` 只在交互式界面里可用，print / stream 模式会拒绝由 CLI 处理的斜杠命令，
+> 所以 headless 场景需要上面这套。
+
+验证方式：在旧会话里记住一个口令，handoff 后在**新会话**（conversation id 不同）追问同一问题，应能正确答出该口令。
+
+代价：handoff 会多花一轮（摘要轮仍是全量上下文），适合"还要继续聊好几轮"的场景；只差一两句就结束的话直接继续更划算。
+
+## 额度查询
+
+`antigravity_quota` 走 CLI 自己回答的 `/quota`，**不起 turn、不扣额度、不留会话**：
+
+```
+Gemini Models            Weekly Limit Remaining         99%
+Gemini Models            Five Hour Limit Remaining      99%
+Claude and GPT models    Weekly Limit Remaining         72%
+Claude and GPT models    Five Hour Limit Remaining     100%
+```
+
+结果缓存 60 秒（`AGY_MCP_QUOTA_CACHE_SEC`）。
+
+## 参数（`antigravity_ask`，除 `prompt` 外均可省略）
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `prompt` | 必填 | 提示词 |
+| `session` | `default` | 会话名，同名 + 同 workspace 续接 |
+| `new_session` | `false` | 重开会话 |
+| `handoff` | `false` | 压成交接摘要后**开新会话**继续 |
+| `conversation` | 无 | 直接指定要续接的会话 id |
+| `continue_session` | `false` | 让 CLI 自己挑最近一个会话续接 |
+| `cwd` | 当前工作目录 | 作为 Antigravity 会话的 workspace |
+| `model` / `agent` / `effort` | 无 | 透传 `--model` / `--agent` / `--effort` |
+| `mode` | 无 | `plan` 或 `accept-edits` |
+| `sandbox` | `true` | `--sandbox`，开启终端限制 |
+| `skip_permissions` | `false` | 自动批准 Antigravity 的工具调用（**谨慎**） |
+| `output_format` | `text` | `text`（返回解析后的回答）或 `json`（返回 CLI 原始 JSON） |
+| `timeout_sec` | `300` | 单次调用超时（另加 30 秒宽限） |
+| `extra_args` | 无 | 追加任意 `agy` 原始参数 |
+
+## 安全默认值
+
+- 默认 `--sandbox` 且不自动批准工具：Antigravity 的工具调用不会被静默放开。
+- 需要它读写某个目录时显式传 `cwd`，再按需打开 `mode=accept-edits` 或 `skip_permissions=true`，把范围限制在目标目录。
+- 服务器只在 stdio 上跑 MCP 协议，日志走 stderr，不写任何凭据文件。
+- 工具被沙箱拒绝时（CLI 仍返回 `status=SUCCESS` 但回答为空）会被识别成明确错误，而不是空回答。
+
+## 关于"反代 / 转 API"的取舍
+
+把 `agy` 反代成 OpenAI 兼容接口，好处是能当模型用；代价是要维护一个常驻转发服务，并把 Google 凭据交给它，
+而且这类做法在账号侧风险更高（非官方客户端、凭据离开官方存储、机器化流量形状）。
+
+MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OAuth 一直待在系统凭据存储里，
+客户端只是触发一次本地进程调用。第三条靠护栏收敛（见下）。
+
+## 护栏（默认开启）
+
+| 护栏 | 默认 | 环境变量 |
+| --- | --- | --- |
+| 单飞锁：同一时刻只跑一个 `agy` 会话（跨进程文件锁），并发调用排队 | 开 | 等待上限 600 秒 |
+| 两次会话之间的最小间隔（热轮只有约 1.4 秒，默认下限会盖过它，追求速度可降到 1~2 秒） | 5 秒 | `AGY_MCP_MIN_INTERVAL_SEC` |
+| 每日调用上限，防止循环调用打光额度 | 200 次 | `AGY_MCP_MAX_CALLS_PER_DAY`（`0` = 不限） |
+| 本地用量日志：时间、会话、会话 id、是否续接、模型、cwd、prompt 字符数、耗时、退出码、token 用量 | 开 | `AGY_MCP_STATE_DIR` |
+
+用量日志默认**不写 prompt 正文**，只记长度。失败调用不计入每日上限。
+
+## 环境变量
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `AGY_BIN` | 自动探测 | `agy` 可执行文件路径 |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 无（**一般必须设**） | `agy` 访问 Google |
+| `NO_PROXY` | `localhost,127.0.0.1,::1` | 本机回环不走代理 |
+| `AGY_MCP_TRANSPORT` | `stream` | `stream` = 每会话驻留进程；`oneshot` = 每次调用新进程 |
+| `AGY_MCP_WORKER_IDLE_SEC` | `900` | 驻留进程空闲回收时间 |
+| `AGY_MCP_INSTANCE_WINDOW_SEC` | `120` | 判定"另一个实例仍活跃"的时间窗 |
+| `AGY_MCP_MIN_INTERVAL_SEC` | `5` | 两次调用最小间隔 |
+| `AGY_MCP_MAX_CALLS_PER_DAY` | `200` | 每日调用上限（`0` = 不限） |
+| `AGY_MCP_LONG_CONTEXT_TOKENS` | `100000` | 超过多少 input token 提醒 handoff（`0` = 关闭） |
+| `AGY_MCP_QUOTA_CACHE_SEC` | `60` | 额度结果缓存时长 |
+| `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
+| `AGY_CLI_HOME` | `~/.gemini/antigravity-cli` | CLI 自身状态目录（一般不用改） |
+
+## 状态文件
+
+| 路径 | 作用 |
+| --- | --- |
+| `~/.agy-mcp/sessions.json` | 会话名 → 会话 id / workspace / 轮次（按实例隔离） |
+| `~/.agy-mcp/state.json` | 当日调用次数、token 累计、最小间隔时间戳 |
+| `~/.agy-mcp/usage.jsonl` | 每次调用一行（不含 prompt 正文） |
+| `~/.agy-mcp/call.lock` | 跨进程单飞锁 |
+| `~/.gemini/antigravity-cli/` | `agy` 自身状态：会话库、缓存与日志 |
+
+## 排障
+
+| 现象 | 处理 |
+| --- | --- |
+| `dial tcp 172.217.x.x:443 ... failed to respond`，或 `Please sign in` | 没设代理。用 `--proxy` 重跑注册脚本 |
+| 调用卡住几分钟无输出 | 同上，多半在等 Google 超时 |
+| 空回答 / `denied_actions` | 沙箱拒绝了它需要的工具。看提示里的权限名，需要就传 `skip_permissions: true`，或在 CLI 的 `settings.json` 加 allow 规则 |
+| 客户端里看不到 `antigravity_*` 工具 | 客户端不热加载 MCP，新开会话；确认配置里的 `[mcp_servers.antigravity]` 还在 |
+| 换了目录后对话"失忆" | 会话按 workspace 绑定，换目录会新开；跨目录续接请显式传 `conversation` |
+| 第一次调用明显比后面慢 | 正常：首次要冷启动会话进程（约 7 秒），之后热轮通常 1~2 秒 |
+| 上下文越来越慢、越来越贵 | 续接会重发全部历史；用 `handoff: true` 压缩后开新会话，或 `new_session: true` 直接重开 |
+| 达到每日上限（`Daily Antigravity cap reached`） | 等次日，或调 `AGY_MCP_MAX_CALLS_PER_DAY` |
+| 回答不是干净正文 | 传 `output_format: "json"` 看 CLI 原始返回 |
+| macOS 上找不到 `agy` | `which agy`，或 `export AGY_BIN=...`；脚本按 `AGY_BIN` → `PATH` → `~/.local/bin/agy` 顺序探测 |
+
+## 已知边界
+
+- MCP 工具只能被客户端**主动调用**，不能替代会话的默认模型，因此 Antigravity 不会出现在模型选择器里。
+- 一次调用 = 一整个 Antigravity 会话（含其自身的系统提示与工具），不适合当高频、低延迟的模型接口。
+- 会话历史会随续接一起发送，长会话的 input token 与耗时都会上升。
+- 这是用消费级订阅额度做程序化调用，是否可接受请自行判断；护栏只是让流量形状更接近正常 CLI 使用。
+
+## 开发
+
+```bash
+python3 -m py_compile agy_mcp.py register_agy_mcp.py
+python3 test_agy_mcp.py     # 离线测试：不需要网络、账号或 agy
+```
+
+CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
+
+## 许可
+
+[MIT](LICENSE)。
