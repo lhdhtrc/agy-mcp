@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from core import session
 from core.agy import CREATE_NO_WINDOW, agy_command_prefix, kill_process_tree, resolve_agy
 from core.session import _write_worker_pids, track_worker_pid  # Worker 生命周期要用
+from core.jobs import running_job_count  # 已抽出，正常导入
 from core.config import (
     WORKER_IDLE_SEC,
     log,
@@ -225,7 +226,6 @@ def shutdown_workers() -> None:
 def reap_orphan_workers() -> None:
     """A server killed with SIGKILL/TerminateProcess cannot clean up its session processes."""
     # 只要可能还有长作业在跑就不要清理：否则会把它的进程一起杀掉。
-    from core.impl import running_job_count  # 临时债：core/jobs.py 抽出后改回 core.jobs
     pending = running_job_count()
     if pending:
         log(f"skipping orphan cleanup: {pending} job(s) still marked running")

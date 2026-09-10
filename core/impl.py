@@ -86,6 +86,19 @@ from core.config import (  # noqa: E402
     _env_int,
     log,
 )
+# 后台作业（落盘、脱离进程、结果回收）已抽到 core/jobs.py
+from core.jobs import (  # noqa: E402,F401
+    DETACHED_PROCESS,
+    JOBS,
+    JOBS_DIR,
+    JOBS_LOCK,
+    _job_path,
+    collect_detached_job,
+    list_jobs,
+    read_job,
+    running_job_count,
+    write_job,
+)
 # 常驻会话进程与回收/信号处理已抽到 core/worker.py
 from core.worker import (  # noqa: E402,F401
     WORKERS,
@@ -1900,98 +1913,6 @@ def serve() -> int:
 
 
 PROBE_PROMPT = "Reply with exactly one word: OK"
-
-
-JOBS: Dict[str, Dict[str, Any]] = {}
-JOBS_LOCK = threading.Lock()
-JOBS_DIR = os.path.join(STATE_DIR, "jobs")
-
-
-def _job_path(job_id: str) -> str:
-    return os.path.join(JOBS_DIR, f"{job_id}.json")
-
-
-def write_job(job_id: str, payload: Dict[str, Any]) -> None:
-    """Jobs live on disk so a client restart does not lose track of a long run."""
-    try:
-        os.makedirs(JOBS_DIR, exist_ok=True)
-        tmp = _job_path(job_id) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False)
-        os.replace(tmp, _job_path(job_id))
-    except (OSError, ValueError) as exc:
-        log(f"could not persist job {job_id}: {exc}")
-
-
-def read_job(job_id: str) -> Optional[Dict[str, Any]]:
-    try:
-        with open(_job_path(job_id), encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError):
-        return None
-
-
-def list_jobs() -> List[Dict[str, Any]]:
-    try:
-        names = sorted(name for name in os.listdir(JOBS_DIR) if name.endswith(".json"))
-    except OSError:
-        return []
-    jobs = []
-    for name in names:
-        job = read_job(name[: -len(".json")])
-        if job:
-            jobs.append(job)
-    return jobs
-
-
-def running_job_count() -> int:
-    return sum(1 for job in list_jobs() if job.get("state") == "running")
-
-
-DETACHED_PROCESS = 0x00000008
-
-
-def collect_detached_job(job: Dict[str, Any]) -> Dict[str, Any]:
-    """Turn a finished detached run into a result: the process wrote its JSON to a file.
-
-    Nothing here depends on the server that started it, which is what lets a job
-    survive a client restart.
-    """
-    if job.get("state") != "running" or pid_alive(int(job.get("pid") or 0)):
-        return job
-    try:
-        with open(str(job.get("out") or ""), encoding="utf-8", errors="replace") as handle:
-            text = handle.read()
-    except OSError:
-        text = ""
-    payload = parse_json_output(text)
-    answer = extract_answer(payload) if payload else None
-    conversation = str(payload.get("conversation_id") or "") if payload else ""
-    if answer and conversation:
-        sessions = read_sessions()
-        name = str(job.get("session") or DEFAULT_SESSION)
-        entry = sessions.get(name) if isinstance(sessions.get(name), dict) else {}
-        sessions[name] = dict(
-            entry,
-            conversation_id=conversation,
-            workspace=job.get("cwd"),
-            updated=time.strftime("%Y-%m-%dT%H:%M:%S"),
-            calls=int(entry.get("calls", 0) or 0) + 1,
-        )
-        write_sessions(sessions)
-    job = dict(
-        job,
-        state="done" if answer else "failed",
-        conversation=conversation or None,
-        finished=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        result=text_result(
-            answer or (text.strip()[-2000:] if text.strip() else "job finished without output"),
-            not answer,
-        ),
-    )
-    write_job(str(job.get("job_id")), job)
-    return job
 
 
 def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
