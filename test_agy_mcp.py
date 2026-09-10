@@ -24,6 +24,7 @@ sys.path.insert(0, HERE)
 
 # 直接导入实现模块：测试会读写它的模块级变量（如 INSTANCE_ID），必须拿到同一个模块对象
 import core.impl as agy_mcp  # noqa: E402  (import after the state dir is set)
+import core.session  # noqa: E402 —— 补丁要打在拥有该状态的模块上
 
 # Antigravity CLI 的替身：既能说 print 模式（`-p ... --output-format json`），
 # 也能说常驻会话进程用的 stream 传输。这样整套轮次协议都能离线测试，
@@ -515,12 +516,12 @@ def test_orphaned_workers_are_reaped() -> None:
     sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
     try:
         agy_mcp._write_worker_pids([sleeper.pid])
-        original = agy_mcp._is_agy_process
-        agy_mcp._is_agy_process = lambda pid: True  # the guard is tested separately
+        original = core.session._is_agy_process
+        core.session._is_agy_process = lambda pid: True  # 守卫逻辑另有用例覆盖
         try:
             agy_mcp.reap_orphan_workers()
         finally:
-            agy_mcp._is_agy_process = original
+            core.session._is_agy_process = original
         time.sleep(1.0)
         assert sleeper.poll() is not None, "orphaned session process should have been killed"
         assert agy_mcp._read_worker_pids() == []

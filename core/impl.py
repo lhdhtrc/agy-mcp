@@ -56,6 +56,14 @@ from core.config import (  # noqa: E402
     _env_int,
     log,
 )
+# 会话进程 pid 的落盘与清理已抽到 core/session.py；
+# 会被测试猴补丁的 _is_agy_process / _read_worker_pids 必须走模块对象调用
+from core import session  # noqa: E402
+from core.session import (  # noqa: E402,F401
+    _read_worker_pids,
+    _write_worker_pids,
+    track_worker_pid,
+)
 
 # 护栏：CLI 是官方客户端，但额度本是给人驱动 agent 用的。串行化调用、限制每日总量，
 # 是为了让流量形状保持"正常"——这也是包装层在账号风险上唯一能做的事。
@@ -745,55 +753,8 @@ def shutdown_workers() -> None:
     _write_worker_pids([])
 
 
-WORKER_PID_FILE = os.path.join(STATE_DIR, "workers.json")
 
 
-def _read_worker_pids() -> List[int]:
-    try:
-        with open(WORKER_PID_FILE, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return [int(pid) for pid in data if isinstance(pid, int)]
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return []
-
-
-def _write_worker_pids(pids: List[int]) -> None:
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(WORKER_PID_FILE, "w", encoding="utf-8") as handle:
-            json.dump(sorted(set(pids)), handle)
-    except OSError:
-        pass
-
-
-def track_worker_pid(pid: Optional[int], add: bool) -> None:
-    """Remember session process ids so a hard-killed server can be cleaned up later."""
-    if not pid:
-        return
-    pids = _read_worker_pids()
-    if add:
-        pids.append(pid)
-    elif pid in pids:
-        pids.remove(pid)
-    _write_worker_pids(pids)
-
-
-def _is_agy_process(pid: int) -> bool:
-    """Guard against pid reuse: only kill a process that still looks like the CLI."""
-    try:
-        if os.name == "nt":
-            out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW,
-            ).stdout
-        else:
-            out = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "comm="],
-                capture_output=True, text=True, timeout=15,
-            ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "agy" in out.lower()
 
 
 def reap_orphan_workers() -> None:
@@ -803,11 +764,11 @@ def reap_orphan_workers() -> None:
     if pending:
         log(f"skipping orphan cleanup: {pending} job(s) still marked running")
         return
-    pids = _read_worker_pids()
+    pids = session._read_worker_pids()
     if not pids:
         return
     for pid in pids:
-        if not _is_agy_process(pid):
+        if not session._is_agy_process(pid):
             continue
         try:
             if os.name == "nt":
