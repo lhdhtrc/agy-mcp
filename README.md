@@ -4,6 +4,8 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
+> 当前版本 v0.1.0，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
 - 每个客户端会话复用一个常驻 `agy` 进程：首次调用约 7 秒，之后热轮通常 1~2 秒（视网络而定）
