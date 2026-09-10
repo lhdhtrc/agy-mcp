@@ -22,7 +22,8 @@ os.environ["AGY_MCP_STATE_DIR"] = STATE_DIR
 os.environ["AGY_MCP_MIN_INTERVAL_SEC"] = "0"
 sys.path.insert(0, HERE)
 
-import agy_mcp  # noqa: E402  (import after the state dir is set)
+# 直接导入实现模块：测试会读写它的模块级变量（如 INSTANCE_ID），必须拿到同一个模块对象
+import core.impl as agy_mcp  # noqa: E402  (import after the state dir is set)
 
 # Antigravity CLI 的替身：既能说 print 模式（`-p ... --output-format json`），
 # 也能说常驻会话进程用的 stream 传输。这样整套轮次协议都能离线测试，

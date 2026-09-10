@@ -11,6 +11,9 @@
 >
 > 详细文档见 [docs/](docs/README.md)：[复用 Codex 的工具（含浏览器）](docs/codex-tools.md)、
 > [排障与兼容性](docs/troubleshooting.md)。
+>
+> 代码结构：实现都在 `core/` 包里，`main.py` 是正式入口，`agy_mcp.py` 是等价的兼容壳
+> （既有客户端配置写的就是它，继续可用）。拆分计划见 [docs/refactor-plan.md](docs/refactor-plan.md)。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
