@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.0，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.1.1，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
@@ -25,9 +25,15 @@
 ```bash
 git clone <this-repo> && cd agy-mcp
 
-# 自检：agy 路径、版本、登录状态、当日调用与 token 用量
+# 一次性自检：路径 / 代理 / 版本 / 登录 / 额度 / 真跑一个小提问
+python3 agy_mcp.py --self-test
+
+# 只看状态（不消耗额度）：当日调用与 token、耗时统计、会话进程
 python3 agy_mcp.py --status
 ```
+
+`--self-test` 会逐步打印检查结果，最后给出 `self-test OK` 或失败项清单；`--skip-ask` 跳过那条会花一点点额度的
+实测提问，`--no-proxy-required` 把"没有代理"从失败降级为提示。
 
 ### macOS / Linux
 
@@ -46,6 +52,14 @@ python3 agy_mcp.py --status
 1. 默认安装在 `%LOCALAPPDATA%\agy\bin\agy.exe`，脚本会自动探测。
 2. 登录一次：终端运行 `agy`。OAuth token 存在 **Windows 凭据管理器**。
 3. 代理（见下节）。
+
+配置里不想写两行（解释器 + 脚本路径）的话，用仓库里的 `agy-mcp.cmd` 包装，只写一行命令即可：
+
+```toml
+[mcp_servers.antigravity]
+type = "stdio"
+command = '''C:\tools\agy-mcp\agy-mcp.cmd'''
+```
 
 ## 必须设置代理
 
@@ -166,8 +180,9 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 `agy` 会话进程，不再继续烧额度，也不再回一条没人要的响应；下次调用会自动接着同一会话继续。
 工具调用在服务器内保持先进先出，所以不会出现两轮抢同一个会话。
 
-**进度**：客户端请求里带 `progressToken` 时，服务器会把每一步（CLI 的 `step_update`）转成
-`notifications/progress` 发出去，长时间任务不会再看起来像卡死。
+**进度**：客户端请求里带 `progressToken` 时，服务器会把每一步转成 `notifications/progress` 发出去——
+包括步骤类型与状态，以及**正在生成的那段文字**（例如 `step 2: agent_response ACTIVE — 1 2 3 4 5`），
+长时间任务不会再看起来像卡死。默认节流到每 400ms 一条，可用 `AGY_MCP_PROGRESS_INTERVAL_MS` 调整。
 
 ## 切换会话与 handoff
 
@@ -270,6 +285,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `AGY_MCP_SHUTDOWN_GRACE_SEC` | `10` | 客户端关闭连接后，等待在跑的工具调用收尾的秒数（超时则中止） |
 | `AGY_MCP_AUTO_HANDOFF` | `0` | 设 `1` 时，上下文超过阈值的那次调用会**自动**压缩并换新会话 |
 | `AGY_MCP_USAGE_ROTATE_MB` | `5` | 用量日志超过该大小就丢掉较旧的一半（`0` = 不轮转） |
+| `AGY_MCP_PROGRESS_INTERVAL_MS` | `400` | 进度通知最小间隔（`0` = 不节流） |
 | `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
 | `AGY_CLI_HOME` | `~/.gemini/antigravity-cli` | CLI 自身状态目录（一般不用改） |
 
@@ -329,12 +345,12 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 13 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 14 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
 覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**、
-进度通知、自动 handoff。
+进度通知（含文字片段）、自动 handoff、`--self-test`。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

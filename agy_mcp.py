@@ -26,7 +26,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.1"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -62,6 +62,7 @@ DEFAULT_ADOPT_WINDOW_SEC = 120.0
 DEFAULT_LONG_CONTEXT_TOKENS = 100000
 DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
 DEFAULT_USAGE_ROTATE_MB = 5.0
+DEFAULT_PROGRESS_INTERVAL_MS = 400
 HANDOFF_PROMPT = (
     "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
     "Requirements:\n"
@@ -671,11 +672,15 @@ class Worker:
                     return result
             elif on_progress is not None and event.get("event") != "init":
                 steps += 1
-                label = str(
-                    event.get("step_type") or event.get("type") or event.get("event") or "step"
-                )
+                update = event.get("step_update")
+                update = update if isinstance(update, dict) else {}
+                step_type = str(update.get("step_type") or event.get("step_type") or "step")
+                state = str(update.get("state") or "")
+                label = f"{step_type} {state}".strip()
+                delta = update.get("text_delta")
+                detail = summarize_delta(delta) if isinstance(delta, str) else None
                 try:
-                    on_progress(steps, label)
+                    on_progress(steps, label, detail)
                 except Exception as exc:  # noqa: BLE001 - progress must never break a turn
                     log(f"progress callback failed: {exc!r}")
 
@@ -703,6 +708,7 @@ LONG_CONTEXT_TOKENS = _env_int("AGY_MCP_LONG_CONTEXT_TOKENS", DEFAULT_LONG_CONTE
 SHUTDOWN_GRACE_SEC = _env_float("AGY_MCP_SHUTDOWN_GRACE_SEC", DEFAULT_SHUTDOWN_GRACE_SEC)
 AUTO_HANDOFF = _env_int("AGY_MCP_AUTO_HANDOFF", 0) != 0
 USAGE_ROTATE_BYTES = int(_env_float("AGY_MCP_USAGE_ROTATE_MB", DEFAULT_USAGE_ROTATE_MB) * 1024 * 1024)
+PROGRESS_INTERVAL_MS = _env_int("AGY_MCP_PROGRESS_INTERVAL_MS", DEFAULT_PROGRESS_INTERVAL_MS)
 
 
 def reap_workers() -> None:
@@ -754,6 +760,7 @@ class ActiveTask:
     def __init__(self, request_id: Any, progress_token: Any = None) -> None:
         self.request_id = request_id
         self.progress_token = progress_token
+        self.last_progress = 0.0
         self.cancelled = threading.Event()
         self.suppress_response = False
         self.worker: Optional["Worker"] = None
@@ -804,11 +811,32 @@ def cancel_task(request_id: Any) -> bool:
     return True
 
 
-def notify_progress(progress: float, message: str, task: Optional[ActiveTask] = None) -> None:
+def summarize_delta(text: str, limit: int = 120) -> str:
+    """Collapse a streamed text delta into a short single-line preview."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return "…" + collapsed[-limit:]
+
+
+def notify_progress(
+    progress: float,
+    message: str,
+    task: Optional[ActiveTask] = None,
+    force: bool = False,
+) -> None:
     """Tell the client how a long turn is going (only if it asked for progress)."""
     task = task or current_task()
     if task is None or task.progress_token is None:
         return
+    now = time.monotonic()
+    if (
+        not force
+        and PROGRESS_INTERVAL_MS > 0
+        and (now - task.last_progress) * 1000 < PROGRESS_INTERVAL_MS
+    ):
+        return
+    task.last_progress = now
     with SEND_LOCK:
         send(
             {
@@ -1080,7 +1108,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     code = 0
     worker: Optional[Worker] = None
 
-    notify_progress(0, "queued for Antigravity")
+    notify_progress(0, "queued for Antigravity", force=True)
     try:
         with FileLock(LOCK_PATH, LOCK_WAIT_SEC):
             state = read_state()
@@ -1128,7 +1156,9 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     digest_payload = worker.send(
                         handoff_prompt(),
                         timeout_sec + TIMEOUT_GRACE_SEC,
-                        on_progress=lambda step, label: notify_progress(step, f"handoff digest: {label}"),
+                        on_progress=lambda step, label, detail: notify_progress(
+                            step, f"handoff digest: {label}" + (f" — {detail}" if detail else "")
+                        ),
                     )
                     digest = extract_answer(digest_payload) or ""
                     merge_usage(usage_tokens, digest_payload)
@@ -1166,7 +1196,9 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 payload = worker.send(
                     seed_prompt(prompt, digest),
                     timeout_sec + TIMEOUT_GRACE_SEC,
-                    on_progress=lambda step, label: notify_progress(step, f"step {step}: {label}"),
+                    on_progress=lambda step, label, detail: notify_progress(
+                        step, f"step {step}: {label}" + (f" — {detail}" if detail else "")
+                    ),
                 )
             else:
                 digest = None
@@ -1743,7 +1775,91 @@ def serve() -> int:
     return 0
 
 
+def self_test(argv: List[str]) -> int:
+    """One command that answers: is this machine actually able to use agy-mcp right now?
+
+    Options: `--skip-ask` (do not spend a small live turn), `--no-proxy-required`
+    (treat a missing proxy as a warning instead of a failure).
+    """
+    checks: List[Tuple[str, bool, str]] = []
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        checks.append((name, ok, detail))
+        print(f"[{'ok  ' if ok else 'FAIL'}] {name}: {detail}")
+
+    try:
+        record("agy binary", True, resolve_agy())
+    except FileNotFoundError as exc:
+        record("agy binary", False, str(exc))
+
+    proxies = proxy_env_report()
+    proxy_optional = "--no-proxy-required" in argv
+    record(
+        "proxy env",
+        bool(proxies) or proxy_optional,
+        ", ".join(f"{key}={value}" for key, value in proxies.items())
+        if proxies
+        else "no HTTP_PROXY/HTTPS_PROXY visible (required on networks that cannot reach Google directly)",
+    )
+
+    try:
+        code, out, err = run_agy(["--version"], timeout=60)
+        record("agy --version", code == 0, (out or err).strip() or f"exit {code}")
+    except Exception as exc:  # noqa: BLE001 - report, do not raise
+        record("agy --version", False, repr(exc))
+
+    try:
+        code, models = cached_models()
+        first_line = models.splitlines()[0] if models else ""
+        record("signed in (agy models)", code == 0, first_line or "no output")
+    except Exception as exc:  # noqa: BLE001
+        record("signed in (agy models)", False, repr(exc))
+
+    try:
+        payload = read_quota()
+        table = [line for line in (payload.get("response") or "").splitlines() if line.strip()]
+        ok = bool(table) or bool(payload.get("command"))
+        record("quota (/quota, spends no quota)", ok, table[0] if table else str(payload.get("error", "")))
+    except Exception as exc:  # noqa: BLE001
+        record("quota (/quota, spends no quota)", False, repr(exc))
+
+    if "--skip-ask" not in argv:
+        try:
+            code, out, err = run_agy(
+                [
+                    "-p",
+                    "Reply with exactly one word: OK",
+                    "--print-timeout",
+                    "120s",
+                    "--output-format",
+                    "json",
+                    "--sandbox",
+                    "--disable-slash-commands",
+                ],
+                timeout=150,
+            )
+            payload = parse_json_output(out)
+            answer = extract_answer(payload) if payload else None
+            record(
+                "live turn (spends a little quota)",
+                bool(answer) and "OK" in answer.upper(),
+                answer or join_streams(code, out, err)[:200],
+            )
+        except Exception as exc:  # noqa: BLE001
+            record("live turn (spends a little quota)", False, repr(exc))
+
+    failed = [name for name, ok, _ in checks if not ok]
+    print()
+    if failed:
+        print(f"self-test FAILED: {', '.join(failed)}")
+        return 1
+    print("self-test OK: agy-mcp is ready")
+    return 0
+
+
 def main(argv: List[str]) -> int:
+    if "--self-test" in argv:
+        return self_test(argv)
     if "--list-tools" in argv:
         print(json.dumps(TOOLS, ensure_ascii=False, indent=2))
         return 0

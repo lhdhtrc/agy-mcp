@@ -63,7 +63,10 @@ if "stream-json" in argv and "--input-format" in argv:
         turns += 1
         if content.startswith("slow:"):
             time.sleep(60)  # stands in for a long agent turn; a cancel must kill it
-        emit({"event": "step_update", "step_type": "text", "step_index": turns})
+        emit({"event": "step_update", "step_update": {
+            "step_index": turns, "state": "ACTIVE", "step_type": "agent_response",
+            "text_delta": "partial answer " + str(turns),
+        }})
         emit({"event": "result", "result": {
             "conversation_id": conversation,
             "status": "SUCCESS",
@@ -378,7 +381,7 @@ def test_progress_notifications_are_emitted() -> None:
         request["params"]["_meta"] = {"progressToken": "tok-42"}
         messages = run_server_messages(
             [{"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}, request],
-            {"AGY_MCP_STATE_DIR": state},
+            {"AGY_MCP_STATE_DIR": state, "AGY_MCP_PROGRESS_INTERVAL_MS": "0"},
         )
         updates = [
             message
@@ -389,6 +392,36 @@ def test_progress_notifications_are_emitted() -> None:
         assert all(u["params"]["progressToken"] == "tok-42" for u in updates)
         assert any("queued" in str(u["params"]["message"]) for u in updates)
         assert any(u["params"]["progress"] >= 1 for u in updates), updates
+        # The streamed text delta is forwarded so a client can show the answer growing.
+        assert any("agent_response" in str(u["params"]["message"]) for u in updates), updates
+        assert any("partial answer" in str(u["params"]["message"]) for u in updates), updates
+
+
+def test_self_test_reports_ready() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-selftest-") as state:
+        env = {
+            **os.environ,
+            "AGY_MCP_STATE_DIR": state,
+            "AGY_MCP_AGY_CMD": f'"{sys.executable}" "{_fake_cli()}"',
+        }
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(HERE, "agy_mcp.py"),
+                "--self-test",
+                "--no-proxy-required",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            cwd=HERE,
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "self-test OK" in proc.stdout, proc.stdout
+        assert "live turn" in proc.stdout, proc.stdout
 
 
 def test_auto_handoff_compacts_a_long_conversation() -> None:
@@ -430,6 +463,7 @@ TESTS = (
     test_cancelled_turn_is_dropped_and_frees_the_session,
     test_progress_notifications_are_emitted,
     test_auto_handoff_compacts_a_long_conversation,
+    test_self_test_reports_ready,
 )
 
 
