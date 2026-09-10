@@ -64,6 +64,29 @@ core/                        # 全部实现
 `from core.server import main`——绝不能写 `import agy_mcp` 去引用自己（历史上那个同名遮蔽问题
 已经用 `core` 包名绕开，但这条习惯仍要遵守，以免以后再撞上）。
 
+**3. 跨模块调用必须走"模块对象"，不能 import 具体名字**（这是拆分能否不打断测试的关键）：
+
+`test_agy_mcp.py` 里有 4 处**猴补丁**，都打在"定义它的模块"上：
+
+| 被补丁的名字 | 测试怎么用 |
+| --- | --- |
+| `INSTANCE_ID` | 临时改成 `other-instance-1/2`，验证实例隔离与接管 |
+| `_is_agy_process` | 替换成 `lambda pid: True`，验证孤儿清理确实会杀 |
+| `cached_models` | 替换成假模型列表，验证 `auto` 选型 |
+| `_QUOTA_WARNED_AT` | 归零，验证配额提示的冷却 |
+
+Python 的模块全局是**动态查表**，所以只要调用方在调用时才通过模块对象取属性
+（`session.read_sessions()`），补丁就生效；一旦写成 `from .session import read_sessions`
+再加 `read_sessions()`，调用方拿到的是**绑定时的副本**，补丁会静默失效——测试可能"变绿但没测到东西"，
+这比直接报错更危险。
+
+因此拆分纪律：
+
+- 模块之间一律 `from core import session, quota, ...` + `session.read_sessions()` 这种**属性调用**；
+- 只有**常量**（路径、阈值）可以直接 `from core.config import STATE_DIR`，因为没人会去补丁它们；
+- 测试要补丁时，改成补丁**拥有该状态的模块**（例如把 `agy_mcp.INSTANCE_ID` 改为 `core.session.INSTANCE_ID`），
+  并在测试里显式 import 那个模块——这一步要跟着对应拆分一起改，不能提前也不能延后。
+
 因此第一步的正确形态是：
 
 1. 建 `agy_mcp/` 包，`__init__.py` **把当前根文件里的全部顶层名再导出一遍**（先照搬、后精简）；
