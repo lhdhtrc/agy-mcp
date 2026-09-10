@@ -22,8 +22,8 @@ os.environ["AGY_MCP_STATE_DIR"] = STATE_DIR
 os.environ["AGY_MCP_MIN_INTERVAL_SEC"] = "0"
 sys.path.insert(0, HERE)
 
-# 直接导入实现模块：测试会读写它的模块级变量（如 INSTANCE_ID），必须拿到同一个模块对象
-import core.impl as agy_mcp  # noqa: E402  (import after the state dir is set)
+# 导入包本身当门面：需要猴补丁的状态（如 INSTANCE_ID）打在下面两个拥有它的模块上
+import core as agy_mcp  # noqa: E402  (import after the state dir is set)
 import core.quota  # noqa: E402 —— 补丁打在拥有该状态的模块上
 import core.session  # noqa: E402 —— 补丁要打在拥有该状态的模块上
 
@@ -700,33 +700,33 @@ def test_model_defaults_and_auto_selection() -> None:
     original_models, original_quota = core.quota.cached_models, core.quota.read_quota
     core.quota.cached_models = lambda: (0, models)
     try:
-        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 5)})
+        core.quota.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 5)})
         chosen, notes = core.quota.resolve_model("auto")
         assert chosen == "gemini-3.8-flash-high", (chosen, notes)
         assert any("headroom 90%" in note for note in notes), notes
 
-        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(2, 80)})
+        core.quota.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(2, 80)})
         chosen, notes = core.quota.resolve_model("auto")
         assert chosen == "claude-sonnet-4-6", (chosen, notes)
     finally:
         core.quota.cached_models, core.quota.read_quota = original_models, original_quota
-        agy_mcp.QUOTA_CACHE.update({"ts": 0.0, "payload": None})
+        core.quota.QUOTA_CACHE.update({"ts": 0.0, "payload": None})
 
 
 def test_quota_warning_is_warn_only_and_cooldown_limited() -> None:
-    original = dict(agy_mcp.QUOTA_CACHE)
+    original = dict(core.quota.QUOTA_CACHE)
     try:
-        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 90)})
+        core.quota.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(90, 90)})
         core.quota._QUOTA_WARNED_AT = 0.0
         assert core.quota.quota_warning() is None
 
-        agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(4, 90)})
+        core.quota.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(4, 90)})
         warning = core.quota.quota_warning()
         assert warning and "Gemini Models" in warning, warning
         # 冷却：同样的状态不能每次调用都唠叨一遍
         assert core.quota.quota_warning() is None
     finally:
-        agy_mcp.QUOTA_CACHE.update(original)
+        core.quota.QUOTA_CACHE.update(original)
         core.quota._QUOTA_WARNED_AT = 0.0
 
 

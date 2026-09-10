@@ -99,8 +99,8 @@ def run_agy(
         **popen_kwargs,
     )
     # 把这个进程挂到当前调用上，客户端取消时才能杀掉它。
-    # current_task 属于协议层，这里延迟导入以避免循环依赖（等协议层拆分后收敛）。
-    from core.impl import current_task
+    # current_task 在 core/tasks.py 里，而 tasks 依赖本模块，所以这里延迟导入避免循环依赖。
+    from core.tasks import current_task
 
     task = current_task()
     if task is not None:

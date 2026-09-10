@@ -1,12 +1,7 @@
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 agy-mcp contributors
-"""agy-mcp：把 Antigravity CLI（agy）封装成 MCP 服务器，供 Codex 等 MCP 客户端调用。
+"""八个工具的 handler：ask / models / agents / sessions / quota / submit / job / status。
 
-传输方式：stdio 上的 MCP，换行分隔的 JSON-RPC 2.0（不使用 Content-Length 分帧）。
-只依赖 Python 标准库，任何 MCP 客户端都能直接拉起本文件，无需安装依赖。
-
-登录状态由 CLI 自己保管，本服务器从不接触凭据。
+这一层只依赖下面的各层（config / agy / session / worker / quota / jobs / prompts /
+protocol / guard / tasks / diag），不碰协议循环本身的细节，所以可以单独测试与复用。
 """
 
 from __future__ import annotations
@@ -15,51 +10,29 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-# 进程控制（定位 CLI、跑命令、杀进程树）已抽到 core/agy.py
-from core.agy import (
-    CREATE_NO_WINDOW,
-    _git,
-    agy_command_prefix,
-    kill_process_tree,
-    pid_alive,
-    resolve_agy,
-    run_agy,
-)
-# 路径与通用工具已抽到 core/config.py（唯一读环境变量的地方）
+from core.agy import CREATE_NO_WINDOW, agy_command_prefix, resolve_agy, run_agy
 from core.config import (
-    METADATA_TIMEOUT_SEC,  # noqa: E402
-    MIN_INTERVAL_SEC,
-    MAX_CALLS_PER_DAY,
-    WORKER_IDLE_SEC,
-    LONG_CONTEXT_TOKENS,
-    SHUTDOWN_GRACE_SEC,
-    AUTO_HANDOFF,
-    MAX_PROMPT_CHARS,
-    MAX_DIFF_CHARS,
-    PREWARM,
-    DEFAULT_SESSION,
-    DEFAULT_MODEL,
     AGY_CLI_HOME,
-    SESSIONS_PATH,
-    STATE_DIR,
-    log,
-)
-# MCP 协议常量
-from core.config import (  # noqa: E402,F401
-    DEFAULT_PROTOCOL,
+    AUTO_HANDOFF,
+    DEFAULT_MODEL,
+    DEFAULT_SESSION,
     DEFAULT_TIMEOUT_SEC,
-    SERVER_NAME,
-    SERVER_VERSION,
-    SUPPORTED_PROTOCOLS,
+    LONG_CONTEXT_TOKENS,
+    MAX_CALLS_PER_DAY,
+    MAX_DIFF_CHARS,
+    MAX_PROMPT_CHARS,
+    METADATA_TIMEOUT_SEC,
+    MIN_INTERVAL_SEC,
+    SESSIONS_PATH,
     TIMEOUT_GRACE_SEC,
     UNLIMITED_PRINT_TIMEOUT,
+    WORKER_IDLE_SEC,
 )
-# 调用护栏、跨进程锁与用量统计已抽到 core/guard.py
-from core.guard import (  # noqa: E402,F401
+from core.diag import collect_diff, proxy_env_report
+from core.guard import (
     USAGE_PATH,
     calls_today,
     log_usage,
@@ -70,49 +43,7 @@ from core.guard import (  # noqa: E402,F401
     write_state,
     _today,
 )
-# 本地探测（工作树 diff、代理环境）已抽到 core/diag.py
-from core.diag import collect_diff, mask_proxy, proxy_env_report  # noqa: E402,F401
-# 异步任务、取消与进度通知已抽到 core/tasks.py
-from core.tasks import (  # noqa: E402,F401
-    ACTIVE_TASKS,
-    SEND_LOCK,
-    TASKS_LOCK,
-    TOOL_QUEUE,
-    ActiveTask,
-    cancel_task,
-    current_task,
-    finish_task,
-    is_cancelled,
-    notify_progress,
-    register_task,
-    send,
-    _TASK_LOCAL,
-)
-# 协议层纯函数（已搬 text_result / join_streams / parse_json_output / 进度与流解析，剩余逐个搬）
-from core.protocol import (  # noqa: E402,F401
-    ANSWER_KEYS,
-    extract_answer,
-    join_streams,
-    parse_json_output,
-    parse_stream_line,
-    progress_from_event,
-    summarize_delta,
-    text_result,
-)
-# 额度解析、后台刷新、配额告警与 model=auto 选型已抽到 core/quota.py
-from core import quota as quota  # noqa: E402
-from core.quota import *  # noqa: E402,F401,F403 —— 名字多且会被测试补丁，集中导入
-# 提示词拼装（files / diff / no_web / 交接摘要）已抽到 core/prompts.py
-from core.prompts import (  # noqa: E402,F401
-    HANDOFF_PROMPT,
-    attach_diff,
-    attach_files,
-    attach_no_web,
-    handoff_prompt,
-    seed_prompt,
-)
-# 后台作业（落盘、脱离进程、结果回收）已抽到 core/jobs.py
-from core.jobs import (  # noqa: E402,F401
+from core.jobs import (
     DETACHED_PROCESS,
     JOBS,
     JOBS_DIR,
@@ -121,36 +52,46 @@ from core.jobs import (  # noqa: E402,F401
     collect_detached_job,
     list_jobs,
     read_job,
-    running_job_count,
     write_job,
 )
-# 常驻会话进程与回收/信号处理已抽到 core/worker.py
-from core.worker import (  # noqa: E402,F401
-    WORKERS,
-    Worker,
-    _install_signal_handlers,
-    _reaper_loop,
-    reap_orphan_workers,
-    reap_workers,
-    shutdown_workers,
+from core.prompts import (
+    attach_diff,
+    attach_files,
+    attach_no_web,
+    handoff_prompt,
+    seed_prompt,
 )
-# 会话进程 pid 的落盘与清理已抽到 core/session.py；
-# 会被测试猴补丁的 _is_agy_process / _read_worker_pids 必须走模块对象调用
-from core import session  # noqa: E402
-# 会话表本体已抽到 core/session.py（测试仍按顶层名调用，故按名导入）
-from core.session import (  # noqa: E402,F401
-    _read_worker_pids,
-    _write_worker_pids,
+from core.protocol import (
+    extract_answer,
+    join_streams,
+    parse_json_output,
+    text_result,
+)
+from core.quota import (
+    MODELS_CACHE_TTL,
+    QUOTA_CACHE_TTL,
+    cached_models,
+    parse_models,
+    quota_warning,
+    read_quota,
+    reconcile_model_and_effort,
+    refresh_quota_in_background,
+    resolve_model,
+    summarize_quota,
+)
+from core.session import (
+    newest_conversation_since,
     read_last_conversations,
     read_sessions,
     remember_partial_turn,
-    newest_conversation_since,
-    track_worker_pid,
     write_sessions,
 )
+from core.tasks import current_task, is_cancelled, notify_progress
+from core.worker import WORKERS, Worker, reap_workers
+
 
 def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_recent: bool) -> List[str]:
-    """Flags that must hold for the life of a session process."""
+    """拼出一次会话进程必须长期保持一致的参数。"""
     flags: List[str] = []
     if args.get("json_schema"):
         flags += ["--json-schema", str(args["json_schema"])]
@@ -176,41 +117,6 @@ def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_re
     if isinstance(extra, list):
         flags += [str(item) for item in extra]
     return flags
-
-
-FAST_TOOLS = frozenset(
-    {
-        "antigravity_status",
-        "antigravity_models",
-        "antigravity_agents",
-        "antigravity_quota",
-        "antigravity_sessions",
-        "antigravity_submit",
-        "antigravity_job",
-    }
-)
-
-
-def prewarm_default_session() -> None:
-    """Start the default session process early so the first real call is already warm."""
-    try:
-        workspace = os.path.abspath(os.getcwd())
-        base_flags = session_flags(
-            {"sandbox": True, "skip_permissions": True, "disable_slash_commands": True}, None, False
-        )
-        key = f"{DEFAULT_SESSION}|{workspace}|{' '.join(base_flags)}"
-        if key in WORKERS:
-            return
-        worker = Worker(
-            key,
-            ["--input-format", "stream-json", "--output-format", "stream-json"] + base_flags,
-            workspace,
-        )
-        worker.start()
-        WORKERS[key] = worker
-        log(f"prewarmed the default session process for {workspace}")
-    except Exception as exc:  # noqa: BLE001 - prewarming is best effort
-        log(f"prewarm failed: {exc!r}")
 
 
 ASK_SCHEMA: Dict[str, Any] = {
@@ -870,6 +776,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def tool_simple(argv: List[str], label: str) -> Dict[str, Any]:
+    """跑一条只读的 CLI 子命令并把输出原样返回。"""
     try:
         code, out, err = run_agy(argv, timeout=METADATA_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
@@ -1034,201 +941,8 @@ def tool_sessions(args: Dict[str, Any]) -> Dict[str, Any]:
     return text_result(json.dumps(report, ensure_ascii=False, indent=2))
 
 
-HANDLERS = {
-    "antigravity_ask": tool_ask,
-    "antigravity_models": tool_models,
-    "antigravity_agents": lambda args: tool_simple(["agent"], "agent"),
-    "antigravity_sessions": tool_sessions,
-    "antigravity_quota": tool_quota,
-    # 这两个函数定义在后面：延迟解析，好让这张表跟其他工具放一起
-    "antigravity_submit": lambda args: tool_submit(args),
-    "antigravity_job": lambda args: tool_job(args),
-    "antigravity_status": tool_status,
-}
-
-
-def handle_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    method = message.get("method")
-    request_id = message.get("id")
-
-    if method == "initialize":
-        params = message.get("params") or {}
-        requested = params.get("protocolVersion")
-        protocol = requested if requested in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL
-        return {
-            "protocolVersion": protocol,
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        }
-    if method in ("notifications/initialized", "initialized"):
-        return None
-    if method in ("notifications/cancelled", "cancelled"):
-        params = message.get("params") or {}
-        cancel_task(params.get("requestId"))
-        return None
-    if method == "ping":
-        return {}
-    if method == "tools/list":
-        return {"tools": TOOLS}
-    if method == "tools/call":
-        params = message.get("params") or {}
-        name = params.get("name")
-        handler = HANDLERS.get(str(name))
-        if handler is None:
-            return text_result(f"Unknown tool: {name}", True)
-        args = params.get("arguments")
-        if not isinstance(args, dict):
-            args = {}
-        try:
-            return handler(args)
-        except Exception as exc:  # keep the server alive on tool errors
-            log(f"tool {name} failed: {exc!r}")
-            return text_result(f"{name} failed: {exc}", True)
-    if method == "resources/list":
-        return {"resources": []}
-    if method == "resources/templates/list":
-        return {"resourceTemplates": []}
-    if method == "prompts/list":
-        return {"prompts": []}
-    if method == "logging/setLevel":
-        return {}
-
-    if request_id is None:
-        return None
-    return None
-
-
-def _run_tool_call(message: Dict[str, Any], task: ActiveTask) -> None:
-    """Run one tool call in its own thread; the main loop keeps reading for cancellations."""
-    _TASK_LOCAL.task = task
-    error: Optional[Dict[str, Any]] = None
-    result: Optional[Dict[str, Any]] = None
-    try:
-        result = handle_request(message)
-    except Exception as exc:  # noqa: BLE001 - a bad call must not kill the server
-        log(f"tool call failed: {exc!r}")
-        error = {"code": -32603, "message": f"Internal error: {exc}"}
-    finally:
-        finish_task(task.request_id)
-        _TASK_LOCAL.task = None
-
-    if task.suppress_response or task.cancelled.is_set():
-        log(f"dropped the response for cancelled request {task.request_id!r}")
-        return
-    with SEND_LOCK:
-        if error is not None:
-            send({"jsonrpc": "2.0", "id": task.request_id, "error": error})
-        elif result is None:
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": task.request_id,
-                    "error": {"code": -32601, "message": "Method not found"},
-                }
-            )
-        else:
-            send({"jsonrpc": "2.0", "id": task.request_id, "result": result})
-
-
-def _tool_call_loop() -> None:
-    """Single consumer: tool calls stay FIFO, while the main loop keeps reading for cancels."""
-    while True:
-        message, task = TOOL_QUEUE.get()
-        try:
-            _run_tool_call(message, task)
-        except Exception as exc:  # noqa: BLE001 - keep serving whatever happens
-            log(f"tool call loop error: {exc!r}")
-
-
-def serve() -> int:
-    log(f"serving {SERVER_NAME} {SERVER_VERSION}")
-    _install_signal_handlers()
-    reap_orphan_workers()
-    threading.Thread(target=_reaper_loop, daemon=True).start()
-    threading.Thread(target=_tool_call_loop, daemon=True).start()
-    if PREWARM:
-        threading.Thread(target=prewarm_default_session, daemon=True).start()
-    while True:
-        raw = sys.stdin.buffer.readline()
-        if not raw:
-            break
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            log("skipping malformed JSON line")
-            continue
-        if not isinstance(message, dict):
-            continue
-
-        # 工具调用可能阻塞数分钟，所以放到循环之外执行，
-        # 这样期间到达的 `notifications/cancelled` 才能叫停这一轮。
-        if message.get("method") == "tools/call" and message.get("id") is not None:
-            params = message.get("params") or {}
-            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-            task = ActiveTask(message["id"], meta.get("progressToken"))
-            register_task(task)
-            if str(params.get("name") or "") in FAST_TOOLS:
-                # 只读类工具不碰会话进程：绝不排在长轮次后面干等。
-                threading.Thread(target=_run_tool_call, args=(message, task), daemon=True).start()
-            else:
-                TOOL_QUEUE.put((message, task))
-            continue
-
-        try:
-            result = handle_request(message)
-        except Exception as exc:
-            log(f"handler error: {exc!r}")
-            if message.get("id") is not None:
-                with SEND_LOCK:
-                    send(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": message.get("id"),
-                            "error": {"code": -32603, "message": f"Internal error: {exc}"},
-                        }
-                    )
-            continue
-
-        if message.get("id") is None:
-            continue
-        with SEND_LOCK:
-            if result is None:
-                send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": message.get("id"),
-                        "error": {
-                            "code": -32601,
-                            "message": f"Method not found: {message.get('method')}",
-                        },
-                    }
-                )
-            else:
-                send({"jsonrpc": "2.0", "id": message.get("id"), "result": result})
-
-    # stdin 已关闭：先让很快的在跑调用把回答刷出去，再停掉剩下的。
-    deadline = time.monotonic() + SHUTDOWN_GRACE_SEC
-    while time.monotonic() < deadline:
-        with TASKS_LOCK:
-            if not ACTIVE_TASKS:
-                break
-        time.sleep(0.1)
-    with TASKS_LOCK:
-        pending = list(ACTIVE_TASKS)
-    for request_id in pending:
-        cancel_task(request_id)
-    shutdown_workers()
-    return 0
-
-
-PROBE_PROMPT = "Reply with exactly one word: OK"
-
-
 def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Run a turn in the background so a long Antigravity job does not block the client."""
+    """在后台跑一轮，让长作业不阻塞客户端；结果靠 antigravity_job 回收。"""
     job_id = f"job-{int(time.time() * 1000)}-{len(JOBS) + 1}"
     record = {
         "job_id": job_id,
@@ -1357,136 +1071,13 @@ def tool_job(args: Dict[str, Any]) -> Dict[str, Any]:
     return result if isinstance(result, dict) else text_result(str(result))
 
 
-def probe_protocol() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Run one tiny turn and return (result payload, raw stream events).
-
-    The stream protocol is reverse engineered, so this is also the shape check:
-    `init` with a conversation id, `step_update` nested under `step_update`, and a
-    terminal `result` carrying conversation_id/status/response.
-    """
-    workspace = os.path.abspath(os.getcwd())
-    flags = session_flags(
-        {"sandbox": True, "skip_permissions": True, "disable_slash_commands": True}, None, False
-    )
-    events: List[Dict[str, Any]] = []
-    transport = str(os.environ.get("AGY_MCP_TRANSPORT") or "stream").lower()
-    if transport == "stream":
-        worker = Worker(
-            "self-test",
-            ["--input-format", "stream-json", "--output-format", "stream-json"] + flags,
-            workspace,
-        )
-        worker.start()
-        try:
-            payload = worker.send(PROBE_PROMPT, 180, on_event=events.append)
-        finally:
-            worker.stop()
-        return payload, events
-
-    _, out, err = run_agy(
-        ["-p", PROBE_PROMPT] + flags + ["--print-timeout", "180s", "--output-format", "json"],
-        cwd=workspace,
-        timeout=210,
-    )
-    return parse_json_output(out) or {"status": "ERROR", "error": join_streams(0, out, err)[:200]}, events
-
-
-def self_test(argv: List[str]) -> int:
-    """One command that answers: is this machine actually able to use agy-mcp right now?
-
-    Options: `--skip-ask` (do not spend a small live turn), `--no-proxy-required`
-    (treat a missing proxy as a warning instead of a failure).
-    """
-    checks: List[Tuple[str, bool, str]] = []
-
-    def record(name: str, ok: bool, detail: str) -> None:
-        checks.append((name, ok, detail))
-        print(f"[{'ok  ' if ok else 'FAIL'}] {name}: {detail}")
-
-    try:
-        record("agy binary", True, resolve_agy())
-    except FileNotFoundError as exc:
-        record("agy binary", False, str(exc))
-
-    proxies = proxy_env_report()
-    proxy_optional = "--no-proxy-required" in argv
-    record(
-        "proxy env",
-        bool(proxies) or proxy_optional,
-        ", ".join(f"{key}={value}" for key, value in proxies.items())
-        if proxies
-        else "no HTTP_PROXY/HTTPS_PROXY visible (required on networks that cannot reach Google directly)",
-    )
-
-    try:
-        code, out, err = run_agy(["--version"], timeout=60)
-        record("agy --version", code == 0, (out or err).strip() or f"exit {code}")
-    except Exception as exc:  # noqa: BLE001 - report, do not raise
-        record("agy --version", False, repr(exc))
-
-    try:
-        code, models = cached_models()
-        first_line = models.splitlines()[0] if models else ""
-        record("signed in (agy models)", code == 0, first_line or "no output")
-    except Exception as exc:  # noqa: BLE001
-        record("signed in (agy models)", False, repr(exc))
-
-    try:
-        payload = read_quota()
-        table = [line for line in (payload.get("response") or "").splitlines() if line.strip()]
-        ok = bool(table) or bool(payload.get("command"))
-        record("quota (/quota, spends no quota)", ok, table[0] if table else str(payload.get("error", "")))
-    except Exception as exc:  # noqa: BLE001
-        record("quota (/quota, spends no quota)", False, repr(exc))
-
-    if "--skip-ask" not in argv:
-        try:
-            payload, events = probe_protocol()
-            answer = extract_answer(payload)
-            record(
-                "live turn (spends a little quota)",
-                bool(answer) and "OK" in answer.upper(),
-                answer or str(payload.get("error") or payload.get("status") or "no answer"),
-            )
-            missing = [key for key in ("conversation_id", "status", "response") if key not in payload]
-            record(
-                "result shape",
-                not missing,
-                "conversation_id/status/response present" if not missing else f"missing {missing}",
-            )
-            if events:
-                init_ok = any(event.get("event") == "init" and event.get("conversation_id") for event in events)
-                step = [event.get("step_update") for event in events if isinstance(event.get("step_update"), dict)]
-                step_ok = any(update.get("step_type") for update in step)
-                result_ok = any(event.get("event") == "result" for event in events)
-                record(
-                    "stream protocol (init/step_update/result)",
-                    init_ok and step_ok and result_ok,
-                    f"init={init_ok} step_update={step_ok} result={result_ok}",
-                )
-        except Exception as exc:  # noqa: BLE001
-            record("live turn (spends a little quota)", False, repr(exc))
-
-    failed = [name for name, ok, _ in checks if not ok]
-    print()
-    if failed:
-        print(f"self-test FAILED: {', '.join(failed)}")
-        return 1
-    print("self-test OK: agy-mcp is ready")
-    return 0
-
-
-def main(argv: List[str]) -> int:
-    if "--self-test" in argv:
-        return self_test(argv)
-    if "--list-tools" in argv:
-        print(json.dumps(TOOLS, ensure_ascii=False, indent=2))
-        return 0
-    if "--status" in argv:
-        print(tool_status({})["content"][0]["text"])
-        return 0
-    return serve()
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+HANDLERS = {
+    "antigravity_ask": tool_ask,
+    "antigravity_models": tool_models,
+    "antigravity_agents": lambda args: tool_simple(["agent"], "agent"),
+    "antigravity_sessions": tool_sessions,
+    "antigravity_quota": tool_quota,
+    "antigravity_submit": tool_submit,
+    "antigravity_job": tool_job,
+    "antigravity_status": tool_status,
+}
