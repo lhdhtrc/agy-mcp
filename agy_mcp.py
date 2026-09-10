@@ -32,7 +32,7 @@ SERVER_VERSION = "0.1.6"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-DEFAULT_TIMEOUT_SEC = 300
+DEFAULT_TIMEOUT_SEC = int(os.environ.get("AGY_MCP_DEFAULT_TIMEOUT_SEC") or 300)
 TIMEOUT_GRACE_SEC = 30
 
 # Guard rails: the CLI is the vendor's own client, but quota is meant for a human
@@ -497,6 +497,15 @@ def collect_diff(cwd: str, base: Optional[str], limit: int) -> Tuple[str, str]:
     return "\n\n".join(parts), ""
 
 
+def attach_no_web(prompt: str) -> str:
+    """Stop the agent from burning a turn on browser tools (its driver is broken here)."""
+    return (
+        "Do not browse the web or use any browser tool for this task; work only from the "
+        "material given below and your own knowledge, and say so if something is unknown.\n\n"
+        f"{prompt}"
+    )
+
+
 def attach_diff(prompt: str, diff_text: str, source: str) -> str:
     return (
         f"Here is the current working tree state of `{source}` for context:\n\n"
@@ -661,6 +670,8 @@ class Worker:
         self.turns = 0
         self.busy = False
         self.retire = False
+        self.step_count = 0
+        self.last_step_input = 0
 
     def start(self) -> None:
         command = agy_command_prefix()
@@ -769,6 +780,16 @@ class Worker:
                     self.turns += 1
                     return result
             elif on_progress is not None and event.get("event") != "init":
+                update = event.get("step_update")
+                if isinstance(update, dict):
+                    self.step_count += 1
+                    step_usage = update.get("usage")
+                    if isinstance(step_usage, dict) and isinstance(
+                        step_usage.get("input_tokens"), (int, float)
+                    ):
+                        # The last step's input is the real context size; the turn's total is
+                        # the sum over steps and is much larger when tool calls are involved.
+                        self.last_step_input = int(step_usage["input_tokens"])
                 steps += 1
                 parsed = progress_from_event(event)
                 label, detail = parsed if parsed else ("step", None)
@@ -1184,6 +1205,14 @@ ASK_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": "Git ref to diff against when `diff` is used (default: HEAD).",
         },
+        "no_web": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Tell the agent not to browse or use browser tools. Use it for analysis tasks: "
+                "browsing costs many steps and the CLI's browser driver is often unavailable."
+            ),
+        },
         "model": {
             "type": "string",
             "description": (
@@ -1358,6 +1387,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
             True,
         )
     prompt = attach_files(prompt, args.get("files"))
+    if args.get("no_web"):
+        prompt = attach_no_web(prompt)
 
     workspace = os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd())
     if not os.path.isdir(workspace):
@@ -1635,7 +1666,13 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
 
             if succeeded and captured:
                 previous = entry.get("conversation_id")
-                current_input = int(usage_tokens.get("input_tokens", 0) or 0)
+                total_input = int(usage_tokens.get("input_tokens", 0) or 0)
+                # Context size = the last step's input, not the turn total (which sums steps).
+                current_input = (
+                    worker.last_step_input
+                    if worker is not None and worker.last_step_input
+                    else total_input
+                )
                 if (
                     not handoff
                     and LONG_CONTEXT_TOKENS > 0
@@ -1694,6 +1731,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     "status": status_value,
                     "ok": succeeded,
                     "denied_actions": denied,
+                    "steps": worker.step_count if worker is not None else None,
+                    "total_input_tokens": total_input,
                     "usage": usage_tokens,
                 }
             )
