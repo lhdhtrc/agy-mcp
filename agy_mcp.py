@@ -28,12 +28,17 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.7"
+SERVER_VERSION = "0.1.8"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-DEFAULT_TIMEOUT_SEC = int(os.environ.get("AGY_MCP_DEFAULT_TIMEOUT_SEC") or 300)
+# 0 = no limit: a real agent job may take many minutes, and the CLI's own print timeout
+# defaults to 5 minutes, which is what used to cut long turns off.
+DEFAULT_TIMEOUT_SEC = int(os.environ.get("AGY_MCP_DEFAULT_TIMEOUT_SEC") or 0)
 TIMEOUT_GRACE_SEC = 30
+# Metadata calls (models, quota, version) still want a short leash so status cannot hang.
+METADATA_TIMEOUT_SEC = 300
+UNLIMITED_PRINT_TIMEOUT = "24h"
 
 # Guard rails: the CLI is the vendor's own client, but quota is meant for a human
 # driving an agent. Serialising calls and capping daily volume keeps the traffic
@@ -741,12 +746,15 @@ class Worker:
         self.proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
 
-        deadline = time.monotonic() + timeout
+        deadline = (time.monotonic() + timeout) if timeout else None
         steps = 0
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"no result within {int(timeout)}s")
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"no result within {int(timeout)}s")
+            else:
+                remaining = 5.0
             try:
                 tag, line = self.events.get(timeout=min(remaining, 5.0))
             except queue.Empty:
@@ -1508,8 +1516,11 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
         timeout_sec = float(timeout_sec)
     except (TypeError, ValueError):
         return text_result("timeout_sec must be a number.", True)
-    if timeout_sec <= 0:
-        return text_result("timeout_sec must be greater than zero.", True)
+    if timeout_sec < 0:
+        return text_result("timeout_sec must be zero (no limit) or a positive number.", True)
+    # 0 means "no limit": never pass a small --print-timeout, the CLI would cut the turn off.
+    print_timeout = f"{int(timeout_sec)}s" if timeout_sec > 0 else UNLIMITED_PRINT_TIMEOUT
+    call_timeout = (timeout_sec + TIMEOUT_GRACE_SEC) if timeout_sec > 0 else None
 
     payload: Optional[Dict[str, Any]] = None
     captured: Optional[str] = None
@@ -1578,7 +1589,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                         WORKERS[key] = worker
                     digest_payload = worker.send(
                         handoff_prompt(),
-                        timeout_sec + TIMEOUT_GRACE_SEC,
+                        call_timeout,
                         on_progress=lambda step, label, detail: notify_progress(
                             step, f"handoff digest: {label}" + (f" — {detail}" if detail else "")
                         ),
@@ -1618,7 +1629,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     return text_result("Antigravity turn cancelled.", True)
                 payload = worker.send(
                     seed_prompt(prompt, digest),
-                    timeout_sec + TIMEOUT_GRACE_SEC,
+                    call_timeout,
                     on_progress=lambda step, label, detail: notify_progress(
                         step, f"step {step}: {label}" + (f" — {detail}" if detail else "")
                     ),
@@ -1629,10 +1640,10 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     digest_argv = (
                         ["-p", handoff_prompt()]
                         + session_flags(args, conversation, False)
-                        + [f"--print-timeout", f"{int(timeout_sec)}s", "--output-format", "json"]
+                        + ["--print-timeout", print_timeout, "--output-format", "json"]
                     )
                     _, digest_out, _ = run_agy(
-                        digest_argv, cwd=workspace, timeout=timeout_sec + TIMEOUT_GRACE_SEC
+                        digest_argv, cwd=workspace, timeout=call_timeout
                     )
                     digest_payload = parse_json_output(digest_out)
                     digest = extract_answer(digest_payload) if digest_payload else None
@@ -1644,8 +1655,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 if is_cancelled():
                     return text_result("Antigravity turn cancelled.", True)
                 argv = ["-p", seed_prompt(prompt, digest)] + send_flags
-                argv += ["--print-timeout", f"{int(timeout_sec)}s", "--output-format", "json"]
-                code, out, err = run_agy(argv, cwd=workspace, timeout=timeout_sec + TIMEOUT_GRACE_SEC)
+                argv += ["--print-timeout", print_timeout, "--output-format", "json"]
+                code, out, err = run_agy(argv, cwd=workspace, timeout=call_timeout)
                 payload = parse_json_output(out)
 
             duration_ms = int((time.time() - started) * 1000)
@@ -1836,7 +1847,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_simple(argv: List[str], label: str) -> Dict[str, Any]:
     try:
-        code, out, err = run_agy(argv, timeout=DEFAULT_TIMEOUT_SEC)
+        code, out, err = run_agy(argv, timeout=METADATA_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
         return text_result(f"agy {label} timed out.", True)
     except FileNotFoundError as exc:
@@ -1883,7 +1894,7 @@ def cached_models() -> Tuple[int, str]:
         time.time() - float(MODELS_CACHE.get("ts") or 0)
     ) < MODELS_CACHE_TTL:
         return int(MODELS_CACHE.get("code") or 0), str(MODELS_CACHE["output"])
-    code, out, err = run_agy(["models"], timeout=DEFAULT_TIMEOUT_SEC)
+    code, out, err = run_agy(["models"], timeout=METADATA_TIMEOUT_SEC)
     MODELS_CACHE.update({"ts": time.time(), "output": (out or err).strip(), "code": code})
     return code, str(MODELS_CACHE["output"])
 

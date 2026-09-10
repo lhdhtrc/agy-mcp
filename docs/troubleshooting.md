@@ -3,7 +3,7 @@
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
 | `dial tcp 172.217.x.x:443 ... failed to respond`, or `Please sign in` | the CLI has no proxy | `register_agy_mcp.py --proxy http://127.0.0.1:7890` (the Go CLI ignores system proxies) |
-| A call hangs for minutes | waiting on a Google timeout, or a long agent job | check the proxy; for real jobs raise `timeout_sec` (300s is often too tight) |
+| A call hangs for minutes | waiting on a Google timeout, or a long agent job | check the proxy; turns have **no time limit by default**, so this is normal for real jobs |
 | Empty answer, or `finished without any text` | the turn spent itself on tool calls, or hit the context/time limit | narrow the prompt, pass data via `files`/`diff`, add `no_web: true`, raise `timeout_sec`, or start a new session |
 | Precise-looking numbers for "today" | with a broken browser agy cannot fetch live data — it invents them | let Codex fetch the data and hand it over, or share Codex's tools ([codex-tools.md](codex-tools.md)) |
 | `denied_actions` / sandbox message | the sandbox refused a tool the agent needed | a real error, not an empty answer; pass `skip_permissions: true` or add an allow rule |

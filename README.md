@@ -134,7 +134,7 @@ type = "stdio"
 command = "python3"
 args = ["/Users/you/agy-mcp/agy_mcp.py"]
 startup_timeout_sec = 30
-tool_timeout_sec = 900
+tool_timeout_sec = 86400
 
 [mcp_servers.antigravity.env]
 AGY_BIN = "/Users/you/.local/bin/agy"
@@ -151,7 +151,7 @@ type = "stdio"
 command = 'C:\Python312\python.exe'
 args = ['C:\tools\agy-mcp\agy_mcp.py']
 startup_timeout_sec = 30
-tool_timeout_sec = 900
+tool_timeout_sec = 86400
 
 [mcp_servers.antigravity.env]
 AGY_BIN = 'C:\Users\you\AppData\Local\agy\bin\agy.exe'
@@ -160,7 +160,8 @@ HTTPS_PROXY = 'http://127.0.0.1:7890'
 NO_PROXY = 'localhost,127.0.0.1,::1'
 ```
 
-> `tool_timeout_sec` 给足：一次 `agy` 调用可能要跑几分钟，别被客户端默认工具超时掐断。
+> `tool_timeout_sec` 给足：轮次默认不限时，客户端的工具超时才是最后一道闸（默认值往往只有几分钟，
+> 会把长任务掐断）。这里写 86400（一天）。
 
 ## 提供的工具
 
@@ -272,7 +273,7 @@ Claude and GPT models    Five Hour Limit Remaining     100%
 | `skip_permissions` | `true` | 自动批准工具调用（headless 无法弹审批框，关掉就连文件都读不到） |
 | `output_format` | `text` | `text`（返回解析后的回答）或 `json`（返回 CLI 原始 JSON） |
 | `json_schema` | 无 | 透传 `--json-schema`（内联 schema 或文件路径），让回答结构化 |
-| `timeout_sec` | `300` | 单次调用超时（另加 30 秒宽限） |
+| `timeout_sec` | `0`（不限） | 单次调用上限；`0` = 不限时（长任务需要），传正数才加超时与 `--print-timeout` |
 | `extra_args` | 无 | 追加任意 `agy` 原始参数 |
 
 ## 默认权限：自动批准 + 终端沙箱
@@ -360,7 +361,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 
 | 场景 | 怎么调 |
 | --- | --- |
-| 长任务（分析、写长文、逐条评审） | `timeout_sec: 900`（默认 300 秒常被真实的 agent 作业撞到，撞到就会"空回答"）；`AGY_MCP_DEFAULT_TIMEOUT_SEC` 可改全局默认 |
+| 长任务（分析、写长文、逐条评审） | **默认就不限时**：`timeout_sec` 默认 `0` = 无上限，CLI 自带的 5 分钟 print timeout 也一并关掉；想设上限再传 `timeout_sec: 900` |
 | 长任务不阻塞 | 用 `antigravity_submit` 提交（立刻拿到 `job_id`），期间照常干别的，再用 `antigravity_job` 取结果 |
 | 不需要联网的分析 | `no_web: true`——明确禁止浏览。实测浏览器类尝试全是无效功（driver 装不上），会让一轮跑上百步、5 分钟被超时掐断 |
 | 评审改动 | `diff: true` + `prompt="逐条评审这些改动，按 file:line 给结论，指出风险与遗漏"` |
