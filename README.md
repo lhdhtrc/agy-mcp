@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.2.0，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.2.1，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 >
 > 兼容性：目前只在 **Windows** 实机验证过（agy 1.2.0）。macOS / Linux 的代码路径已按平台写好、
 > 离线测试覆盖，但还没有实机跑过 `--self-test`；跑通后欢迎反馈。
@@ -15,7 +15,7 @@
 > 代码结构：实现都在 `core/` 包里，`main.py` 是正式入口，`agy_mcp.py` 是等价的兼容壳
 > （既有客户端配置写的就是它，继续可用）。模块分工见 [docs/modules.md](docs/modules.md)。
 
-- 单文件、纯 Python 标准库、零第三方依赖
+- 纯 Python 标准库、零第三方依赖（实现按职责拆在 `core/` 包里，见 [docs/modules.md](docs/modules.md)）
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
 - 每个客户端会话复用一个常驻 `agy` 进程：首次调用约 7 秒，之后热轮通常 1~2 秒（视网络而定）
 - 内置会话续接、上下文过长提醒、交接（handoff）、额度查询与调用节流
@@ -326,6 +326,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `HTTP_PROXY` / `HTTPS_PROXY` | 无（**一般必须设**） | `agy` 访问 Google |
 | `NO_PROXY` | `localhost,127.0.0.1,::1` | 本机回环不走代理 |
 | `AGY_MCP_TRANSPORT` | `stream` | `stream` = 每会话驻留进程；`oneshot` = 每次调用新进程 |
+| `AGY_MCP_DEFAULT_TIMEOUT_SEC` | `0` | 不传 `timeout_sec` 时的单轮上限（`0` = 不限时） |
 | `AGY_MCP_WORKER_IDLE_SEC` | `900` | 驻留进程空闲回收时间 |
 | `AGY_MCP_INSTANCE_WINDOW_SEC` | `120` | 判定"另一个实例仍活跃"的时间窗 |
 | `AGY_MCP_MIN_INTERVAL_SEC` | `5` | 两次调用最小间隔 |
@@ -356,8 +357,8 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `~/.agy-mcp/sessions.json` | 会话名 → 会话 id / workspace / 轮次（按实例隔离） |
 | `~/.agy-mcp/state.json` | 当日调用次数、token 累计、最小间隔时间戳 |
 | `~/.agy-mcp/usage.jsonl` | 每次调用一行（不含 prompt 正文） |
-| `~/.agy-mcp/call.lock` | 跨进程单飞锁 |
-| `~/.agy-mcp/workers.json` | 当前会话进程的 pid；服务器被强杀后，下次启动据此清理遗留进程 |
+| `~/.agy-mcp/call.lock` | 跨进程单飞锁（`state.lock` / `sessions.lock` / `workers.lock` 分别串行化对应的读-改-写） |
+| `~/.agy-mcp/workers.json` | 按实例分租记录会话进程 pid + 所属服务器 pid；服务器被强杀后，下次启动据此清理遗留进程 |
 | `~/.gemini/antigravity-cli/` | `agy` 自身状态：会话库、缓存与日志 |
 
 ## 常用配方
@@ -381,6 +382,43 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 
 ## 多账号 / 多实例
 
+两件事分开看：
+
+**多个 MCP 实例（多条客户端会话）**是默认支持、无需配置的。会话表按实例隔离，每个实例一个
+`INSTANCE_ID`，所以两个 Codex 线程不会抢同一个 Antigravity 会话；`workers.json` 里的会话进程
+按实例分租，启动时的孤儿清理**只回收服务器进程已经不在的租**，不会误杀另一条线程正在跑的会话进程。
+同一线程内重启服务器会沿用它最近的会话（除非另一个实例仍在活跃期，`AGY_MCP_INSTANCE_WINDOW_SEC`，默认 120 秒）。
+
+**同一台机器上的多个 Antigravity 账号**：给第二条换个条目 id、各用各的状态目录即可
+（前提是 `agy` 自己能区分两个账号——CLI 的多 profile，或用 `AGY_MCP_AGY_CMD` 指向另一份安装 /
+换账号的包装脚本）：
+
+```bash
+python3 register_agy_mcp.py --id antigravity-b \
+  --env AGY_MCP_STATE_DIR=/abs/state-b --env AGY_CLI_HOME=/abs/cli-home-b
+```
+
+它写出来的条目就是下面这样（也可靠手写实现同样的效果）：
+
+```toml
+[mcp_servers.antigravity-b]
+type = "stdio"
+command = 'D:\miniconda\python.exe'
+args = ['D:\project\ShenLunBang\tools\agy-mcp\agy_mcp.py']
+startup_timeout_sec = 30
+tool_timeout_sec = 604800
+
+[mcp_servers.antigravity-b.env]
+AGY_MCP_STATE_DIR = 'C:\Users\you\.agy-mcp-b'
+AGY_CLI_HOME = 'C:\Users\you\.gemini\antigravity-cli-b'
+HTTP_PROXY = 'http://127.0.0.1:7897'
+HTTPS_PROXY = 'http://127.0.0.1:7897'
+NO_PROXY = 'localhost,127.0.0.1,::1'
+```
+
+状态目录必须分开——会话表、用量日志、护栏计数、锁文件都在里面，共用会让两个账号互相串会话。
+（已注册的那条要改环境变量时用 `register_agy_mcp.py --env KEY=VALUE`，它会与已有 env 合并。）
+
 ## 复用 Codex 的工具（浏览器等）
 
 见 [docs/codex-tools.md](docs/codex-tools.md)：为什么（Playwright 旧 CDN 404）、一条命令共享 Codex 的工具、实测结果与注意事项。
@@ -393,13 +431,14 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 
 ```bash
 python3 -m compileall -q core main.py agy_mcp.py register_agy_mcp.py test_agy_mcp.py
-python3 test_agy_mcp.py     # 29 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 37 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
 覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**、
 进度通知（含文字片段）、自动 handoff、`--self-test`、默认权限、`files`、prompt 护栏、结构化 models、
-会话 token 累计、只读工具不排队、孤儿进程回收（含"不误杀无关进程"）。
+会话 token 累计、只读工具不排队、`new_session` 真的换会话、预热进程被复用且不会被拿去续接、
+中断的轮次保住粘住的 model/effort、孤儿进程回收（含"不误杀无关进程"与"不误杀另活在跑的实例"）。
 本地 diff 抓取（含非 git 仓库的降级路径）也在其中。
 `tests/fixtures/stream_turn.ndjson` 是录下来的**真实** stream 转写（已脱敏），用来防协议漂移：
 改解析器时不用装 agy 也能发现回归。
