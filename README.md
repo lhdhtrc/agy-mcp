@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.2，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.1.3，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
@@ -32,8 +32,14 @@ python3 agy_mcp.py --self-test
 python3 agy_mcp.py --status
 ```
 
-`--self-test` 会逐步打印检查结果，最后给出 `self-test OK` 或失败项清单；`--skip-ask` 跳过那条会花一点点额度的
-实测提问，`--no-proxy-required` 把"没有代理"从失败降级为提示。
+`--self-test` 会逐步打印检查结果，最后给出 `self-test OK` 或失败项清单：
+
+- 基础：agy 路径、代理、版本、登录、额度（额度那步不扣额度）
+- 实测一轮（会花一点点额度），并校验**我们依赖的协议形状**：`result` 里是否有 `conversation_id` / `status` /
+  `response`，stream 模式下是否有 `init` / `step_update`（嵌套）/ `result`
+
+这几项是为了防"CLI 升级悄悄改字段"——`stream-json` 不是公开契约，形状一变本地实现就会静默退化。
+`--skip-ask` 跳过实测那步，`--no-proxy-required` 把"没有代理"从失败降级为提示。
 
 ### macOS / Linux
 
@@ -315,6 +321,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `~/.agy-mcp/state.json` | 当日调用次数、token 累计、最小间隔时间戳 |
 | `~/.agy-mcp/usage.jsonl` | 每次调用一行（不含 prompt 正文） |
 | `~/.agy-mcp/call.lock` | 跨进程单飞锁 |
+| `~/.agy-mcp/workers.json` | 当前会话进程的 pid；服务器被强杀后，下次启动据此清理遗留进程 |
 | `~/.gemini/antigravity-cli/` | `agy` 自身状态：会话库、缓存与日志 |
 
 ## 多账号 / 多实例
@@ -363,13 +370,13 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 20 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 22 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
 覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**、
 进度通知（含文字片段）、自动 handoff、`--self-test`、默认权限、`files`、prompt 护栏、结构化 models、
-会话 token 累计、只读工具不排队。
+会话 token 累计、只读工具不排队、孤儿进程回收（含"不误杀无关进程"）。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

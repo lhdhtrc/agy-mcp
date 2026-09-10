@@ -28,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.2"
+SERVER_VERSION = "0.1.3"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -614,6 +614,7 @@ class Worker:
         )
         threading.Thread(target=self._pump, args=(self.proc.stdout, "out"), daemon=True).start()
         threading.Thread(target=self._pump, args=(self.proc.stderr, "err"), daemon=True).start()
+        track_worker_pid(self.proc.pid, True)
 
     def _pump(self, stream: Any, tag: str) -> None:
         try:
@@ -632,12 +633,13 @@ class Worker:
         prompt: str,
         timeout: float,
         on_progress: Optional[Any] = None,
+        on_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         if not self.alive() or self.proc is None or self.proc.stdin is None:
             raise RuntimeError("agy stream process is not running")
         self.busy = True
         try:
-            return self._send_locked(prompt, timeout, on_progress)
+            return self._send_locked(prompt, timeout, on_progress, on_event)
         finally:
             self.busy = False
 
@@ -646,6 +648,7 @@ class Worker:
         prompt: str,
         timeout: float,
         on_progress: Optional[Any] = None,
+        on_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         assert self.proc is not None and self.proc.stdin is not None
 
@@ -685,6 +688,11 @@ class Worker:
                 continue
             if not isinstance(event, dict):
                 continue
+            if on_event is not None:
+                try:
+                    on_event(event)
+                except Exception as exc:  # noqa: BLE001 - diagnostics must not break a turn
+                    log(f"event callback failed: {exc!r}")
             if event.get("conversation_id"):
                 self.conversation_id = str(event["conversation_id"])
             if event.get("event") == "result":
@@ -714,6 +722,7 @@ class Worker:
         self.proc = None
         if proc is None:
             return
+        track_worker_pid(proc.pid, False)
         try:
             if proc.stdin:
                 proc.stdin.close()
@@ -755,6 +764,81 @@ def shutdown_workers() -> None:
     for worker in list(WORKERS.values()):
         worker.stop()
     WORKERS.clear()
+    _write_worker_pids([])
+
+
+WORKER_PID_FILE = os.path.join(STATE_DIR, "workers.json")
+
+
+def _read_worker_pids() -> List[int]:
+    try:
+        with open(WORKER_PID_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return [int(pid) for pid in data if isinstance(pid, int)]
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+
+
+def _write_worker_pids(pids: List[int]) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(WORKER_PID_FILE, "w", encoding="utf-8") as handle:
+            json.dump(sorted(set(pids)), handle)
+    except OSError:
+        pass
+
+
+def track_worker_pid(pid: Optional[int], add: bool) -> None:
+    """Remember session process ids so a hard-killed server can be cleaned up later."""
+    if not pid:
+        return
+    pids = _read_worker_pids()
+    if add:
+        pids.append(pid)
+    elif pid in pids:
+        pids.remove(pid)
+    _write_worker_pids(pids)
+
+
+def _is_agy_process(pid: int) -> bool:
+    """Guard against pid reuse: only kill a process that still looks like the CLI."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW,
+            ).stdout
+        else:
+            out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "agy" in out.lower()
+
+
+def reap_orphan_workers() -> None:
+    """A server killed with SIGKILL/TerminateProcess cannot clean up its session processes."""
+    pids = _read_worker_pids()
+    if not pids:
+        return
+    for pid in pids:
+        if not _is_agy_process(pid):
+            continue
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW, timeout=15,
+                )
+            else:
+                os.kill(pid, signal.SIGTERM)
+            log(f"reaped orphaned session process {pid}")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _write_worker_pids([])
 
 
 def _reaper_loop(interval: float = 60.0) -> None:
@@ -1844,6 +1928,7 @@ def _tool_call_loop() -> None:
 def serve() -> int:
     log(f"serving {SERVER_NAME} {SERVER_VERSION}")
     _install_signal_handlers()
+    reap_orphan_workers()
     threading.Thread(target=_reaper_loop, daemon=True).start()
     threading.Thread(target=_tool_call_loop, daemon=True).start()
     if PREWARM:
@@ -1925,6 +2010,43 @@ def serve() -> int:
     return 0
 
 
+PROBE_PROMPT = "Reply with exactly one word: OK"
+
+
+def probe_protocol() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Run one tiny turn and return (result payload, raw stream events).
+
+    The stream protocol is reverse engineered, so this is also the shape check:
+    `init` with a conversation id, `step_update` nested under `step_update`, and a
+    terminal `result` carrying conversation_id/status/response.
+    """
+    workspace = os.path.abspath(os.getcwd())
+    flags = session_flags(
+        {"sandbox": True, "skip_permissions": True, "disable_slash_commands": True}, None, False
+    )
+    events: List[Dict[str, Any]] = []
+    transport = str(os.environ.get("AGY_MCP_TRANSPORT") or "stream").lower()
+    if transport == "stream":
+        worker = Worker(
+            "self-test",
+            ["--input-format", "stream-json", "--output-format", "stream-json"] + flags,
+            workspace,
+        )
+        worker.start()
+        try:
+            payload = worker.send(PROBE_PROMPT, 180, on_event=events.append)
+        finally:
+            worker.stop()
+        return payload, events
+
+    _, out, err = run_agy(
+        ["-p", PROBE_PROMPT] + flags + ["--print-timeout", "180s", "--output-format", "json"],
+        cwd=workspace,
+        timeout=210,
+    )
+    return parse_json_output(out) or {"status": "ERROR", "error": join_streams(0, out, err)[:200]}, events
+
+
 def self_test(argv: List[str]) -> int:
     """One command that answers: is this machine actually able to use agy-mcp right now?
 
@@ -1975,26 +2097,29 @@ def self_test(argv: List[str]) -> int:
 
     if "--skip-ask" not in argv:
         try:
-            code, out, err = run_agy(
-                [
-                    "-p",
-                    "Reply with exactly one word: OK",
-                    "--print-timeout",
-                    "120s",
-                    "--output-format",
-                    "json",
-                    "--sandbox",
-                    "--disable-slash-commands",
-                ],
-                timeout=150,
-            )
-            payload = parse_json_output(out)
-            answer = extract_answer(payload) if payload else None
+            payload, events = probe_protocol()
+            answer = extract_answer(payload)
             record(
                 "live turn (spends a little quota)",
                 bool(answer) and "OK" in answer.upper(),
-                answer or join_streams(code, out, err)[:200],
+                answer or str(payload.get("error") or payload.get("status") or "no answer"),
             )
+            missing = [key for key in ("conversation_id", "status", "response") if key not in payload]
+            record(
+                "result shape",
+                not missing,
+                "conversation_id/status/response present" if not missing else f"missing {missing}",
+            )
+            if events:
+                init_ok = any(event.get("event") == "init" and event.get("conversation_id") for event in events)
+                step = [event.get("step_update") for event in events if isinstance(event.get("step_update"), dict)]
+                step_ok = any(update.get("step_type") for update in step)
+                result_ok = any(event.get("event") == "result" for event in events)
+                record(
+                    "stream protocol (init/step_update/result)",
+                    init_ok and step_ok and result_ok,
+                    f"init={init_ok} step_update={step_ok} result={result_ok}",
+                )
         except Exception as exc:  # noqa: BLE001
             record("live turn (spends a little quota)", False, repr(exc))
 

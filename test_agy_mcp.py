@@ -499,6 +499,38 @@ def test_sessions_record_token_totals() -> None:
         assert entry["input_tokens"] == 10 and entry["output_tokens"] == 1, entry
 
 
+def test_orphaned_workers_are_reaped() -> None:
+    """A hard-killed server leaves session processes behind; the next start cleans them up."""
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
+    try:
+        agy_mcp._write_worker_pids([sleeper.pid])
+        original = agy_mcp._is_agy_process
+        agy_mcp._is_agy_process = lambda pid: True  # the guard is tested separately
+        try:
+            agy_mcp.reap_orphan_workers()
+        finally:
+            agy_mcp._is_agy_process = original
+        time.sleep(1.0)
+        assert sleeper.poll() is not None, "orphaned session process should have been killed"
+        assert agy_mcp._read_worker_pids() == []
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+
+
+def test_orphan_reaping_never_kills_unrelated_processes() -> None:
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)"])
+    try:
+        agy_mcp._write_worker_pids([sleeper.pid])
+        agy_mcp.reap_orphan_workers()  # real guard: this pid is not the Antigravity CLI
+        time.sleep(0.5)
+        assert sleeper.poll() is None, "must not kill a process that is not agy"
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+            sleeper.wait()
+
+
 def test_read_only_tools_do_not_queue_behind_a_turn() -> None:
     """`models` must answer while a long turn is still running, not after it."""
     with tempfile.TemporaryDirectory(prefix="agy-mcp-fast-") as state:
@@ -558,6 +590,8 @@ TESTS = (
     test_prompt_size_guard,
     test_models_are_returned_structured,
     test_sessions_record_token_totals,
+    test_orphaned_workers_are_reaped,
+    test_orphan_reaping_never_kills_unrelated_processes,
     test_read_only_tools_do_not_queue_behind_a_turn,
 )
 
