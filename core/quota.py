@@ -22,6 +22,7 @@ from core.config import (
     _env_float,
     log,
 )
+from core.protocol import join_streams, parse_json_output
 
 
 QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
@@ -147,7 +148,6 @@ def read_quota() -> Dict[str, Any]:
     if QUOTA_CACHE.get("payload") and (time.time() - float(QUOTA_CACHE.get("ts") or 0)) < QUOTA_CACHE_TTL:
         return QUOTA_CACHE["payload"]
     code, out, err = run_agy(["-p", "/quota", "--output-format", "json"], timeout=90)
-    from core.impl import parse_json_output  # 临时债：等 protocol.py 抽出后改回
     payload = parse_json_output(out)
     if payload:
         QUOTA_CACHE["ts"] = time.time()

@@ -88,6 +88,8 @@ from core.config import (
 )
 # 协议层纯函数（已搬 text_result / join_streams / parse_json_output / 进度与流解析，剩余逐个搬）
 from core.protocol import (  # noqa: E402,F401
+    ANSWER_KEYS,
+    extract_answer,
     join_streams,
     parse_json_output,
     parse_stream_line,
@@ -153,7 +155,6 @@ USAGE_PATH = os.path.join(STATE_DIR, "usage.jsonl")
 _USAGE_SINCE_ROTATE = 0
 # Antigravity CLI 自己的状态（会话 id、workspace 索引）放在这里。
 LOCK_WAIT_SEC = 600
-ANSWER_KEYS = ("response", "result", "text", "output", "content", "message", "answer")
 # 每次新起 `agy -p` 进程都要重做鉴权与模型/额度初始化（约 5 秒）；常驻的
 # `--input-format stream-json` 进程服务一个会话，热轮约 1.5 秒。
 # 一个 Codex 会话对应一个 MCP 服务器实例，因此会话表按实例隔离，两个会话不会抢同一个
@@ -296,30 +297,6 @@ def usage_stats(limit: int = 200) -> Dict[str, Any]:
         "p95_ms": int(pick(0.95)),
         "max_ms": int(durations[-1]),
     }
-
-
-def extract_answer(node: Any, depth: int = 0) -> Optional[str]:
-    """Pull the answer out of the CLI result without grabbing unrelated metadata.
-
-    The result payload is `{conversation_id, status, response, ...}`; never fall back to
-    "any string anywhere", or a metadata id gets returned as the answer.
-    """
-    if depth > 4 or node is None:
-        return None
-    if isinstance(node, str):
-        return node.strip() or None
-    if isinstance(node, dict):
-        for key in ANSWER_KEYS:
-            if key in node:
-                found = extract_answer(node[key], depth + 1)
-                if found:
-                    return found
-        return None
-    if isinstance(node, list):
-        parts = [extract_answer(item, depth + 1) for item in node]
-        joined = "\n".join(part for part in parts if part)
-        return joined or None
-    return None
 
 
 def merge_usage(target: Dict[str, Any], payload: Optional[Dict[str, Any]]) -> None:

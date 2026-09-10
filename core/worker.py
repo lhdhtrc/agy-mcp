@@ -24,6 +24,7 @@ from core.config import (
     WORKER_IDLE_SEC,
     log,
 )
+from core.protocol import parse_stream_line, progress_from_event, summarize_delta  # noqa: F401
 
 class Worker:
     """A long-lived `agy --input-format stream-json` process bound to one conversation."""
@@ -99,9 +100,6 @@ class Worker:
         on_progress: Optional[Any] = None,
         on_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        # 临时债：这三个协议辅助还在 impl（等 core/protocol.py 抽出后改为 core.protocol）
-        from core.impl import parse_stream_line, progress_from_event, summarize_delta
-
         assert self.proc is not None and self.proc.stdin is not None
 
         while not self.events.empty():  # drop anything left over from a previous turn

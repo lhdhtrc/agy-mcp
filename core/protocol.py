@@ -87,3 +87,31 @@ def progress_from_event(event: Dict[str, Any]) -> Optional[Tuple[str, Optional[s
     label = f"{step_type} {state}".strip()
     delta = update.get("text_delta")
     return label, (summarize_delta(delta) if isinstance(delta, str) else None)
+
+
+# 结果里可能承载回答的字段，按优先级排列
+ANSWER_KEYS = ("response", "result", "text", "output", "content", "message", "answer")
+
+
+def extract_answer(node: Any, depth: int = 0) -> Optional[str]:
+    """从 CLI 的结果里取出回答，绝不顺手抓无关的元数据。
+
+    结果的形状是 `{conversation_id, status, response, ...}`；不能退化成"正文里随便找个字符串"，
+    否则会话 id 之类的元数据会被当成答案返回。
+    """
+    if depth > 4 or node is None:
+        return None
+    if isinstance(node, str):
+        return node.strip() or None
+    if isinstance(node, dict):
+        for key in ANSWER_KEYS:
+            if key in node:
+                found = extract_answer(node[key], depth + 1)
+                if found:
+                    return found
+        return None
+    if isinstance(node, list):
+        parts = [extract_answer(item, depth + 1) for item in node]
+        joined = "\n".join(part for part in parts if part)
+        return joined or None
+    return None

@@ -13,7 +13,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 from core import session
+from core.agy import pid_alive
 from core.config import DEFAULT_SESSION, STATE_DIR, log
+from core.protocol import extract_answer, parse_json_output, text_result
 
 
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -79,12 +81,11 @@ def collect_detached_job(job: Dict[str, Any]) -> Dict[str, Any]:
             text = handle.read()
     except OSError:
         text = ""
-    from core.impl import extract_answer, parse_json_output, text_result  # 临时债：等 protocol.py 抽出后改回
     payload = parse_json_output(text)
     answer = extract_answer(payload) if payload else None
     conversation = str(payload.get("conversation_id") or "") if payload else ""
     if answer and conversation:
-        sessions = read_sessions()
+        sessions = session.read_sessions()
         name = str(job.get("session") or DEFAULT_SESSION)
         entry = sessions.get(name) if isinstance(sessions.get(name), dict) else {}
         sessions[name] = dict(
@@ -94,7 +95,7 @@ def collect_detached_job(job: Dict[str, Any]) -> Dict[str, Any]:
             updated=time.strftime("%Y-%m-%dT%H:%M:%S"),
             calls=int(entry.get("calls", 0) or 0) + 1,
         )
-        write_sessions(sessions)
+        session.write_sessions(sessions)
     job = dict(
         job,
         state="done" if answer else "failed",
