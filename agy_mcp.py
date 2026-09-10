@@ -923,6 +923,11 @@ def _is_agy_process(pid: int) -> bool:
 
 def reap_orphan_workers() -> None:
     """A server killed with SIGKILL/TerminateProcess cannot clean up its session processes."""
+    # Never clean up while a long job may still be alive: its process would be killed too.
+    pending = running_job_count()
+    if pending:
+        log(f"skipping orphan cleanup: {pending} job(s) still marked running")
+        return
     pids = _read_worker_pids()
     if not pids:
         return
@@ -2422,19 +2427,67 @@ PROBE_PROMPT = "Reply with exactly one word: OK"
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+JOBS_DIR = os.path.join(STATE_DIR, "jobs")
+
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+
+def write_job(job_id: str, payload: Dict[str, Any]) -> None:
+    """Jobs live on disk so a client restart does not lose track of a long run."""
+    try:
+        os.makedirs(JOBS_DIR, exist_ok=True)
+        tmp = _job_path(job_id) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp, _job_path(job_id))
+    except (OSError, ValueError) as exc:
+        log(f"could not persist job {job_id}: {exc}")
+
+
+def read_job(job_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(_job_path(job_id), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def list_jobs() -> List[Dict[str, Any]]:
+    try:
+        names = sorted(name for name in os.listdir(JOBS_DIR) if name.endswith(".json"))
+    except OSError:
+        return []
+    jobs = []
+    for name in names:
+        job = read_job(name[: -len(".json")])
+        if job:
+            jobs.append(job)
+    return jobs
+
+
+def running_job_count() -> int:
+    return sum(1 for job in list_jobs() if job.get("state") == "running")
 
 
 def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
     """Run a turn in the background so a long Antigravity job does not block the client."""
     job_id = f"job-{int(time.time() * 1000)}-{len(JOBS) + 1}"
+    record = {
+        "job_id": job_id,
+        "state": "running",
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "prompt_chars": len(str(args.get("prompt") or "")),
+        "session": args.get("session") or DEFAULT_SESSION,
+        "model": args.get("model"),
+        "effort": args.get("effort"),
+        "pid": os.getpid(),
+    }
+    write_job(job_id, record)
     with JOBS_LOCK:
-        JOBS[job_id] = {
-            "state": "running",
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "prompt_chars": len(str(args.get("prompt") or "")),
-            "session": args.get("session") or DEFAULT_SESSION,
-            "result": None,
-        }
+        JOBS[job_id] = dict(record, result=None)
 
     def run() -> None:
         try:
@@ -2446,6 +2499,8 @@ def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
             entry = JOBS.get(job_id)
             if entry is not None:
                 entry.update({"state": state, "result": result, "finished": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        saved = dict(record, state=state, result=result, finished=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        write_job(job_id, saved)
 
     threading.Thread(target=run, daemon=True).start()
     return text_result(
@@ -2463,26 +2518,52 @@ def tool_submit(args: Dict[str, Any]) -> Dict[str, Any]:
 def tool_job(args: Dict[str, Any]) -> Dict[str, Any]:
     action = str(args.get("action") or "get").lower()
     job_id = str(args.get("job_id") or "")
-    with JOBS_LOCK:
-        if action == "list":
-            jobs = [
-                {key: value for key, value in entry.items() if key != "result"}
-                for entry in JOBS.values()
-            ]
-            return text_result(json.dumps({"jobs": jobs}, ensure_ascii=False, indent=2))
-        if action == "forget":
-            if job_id:
-                JOBS.pop(job_id, None)
-            else:
+    if action == "list":
+        jobs = [
+            {key: value for key, value in entry.items() if key != "result"}
+            for entry in list_jobs()
+        ]
+        return text_result(json.dumps({"jobs": jobs}, ensure_ascii=False, indent=2))
+    if action == "forget":
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+            if not job_id:
                 JOBS.clear()
-            return text_result("jobs cleared")
+        try:
+            if job_id:
+                os.remove(_job_path(job_id))
+            else:
+                for name in os.listdir(JOBS_DIR):
+                    if name.endswith(".json"):
+                        os.remove(os.path.join(JOBS_DIR, name))
+        except OSError:
+            pass
+        return text_result("jobs cleared")
+
+    with JOBS_LOCK:
         entry = JOBS.get(job_id)
-        if entry is None:
-            return text_result(f"unknown job: {job_id or '(no job_id)'}", True)
-        state = entry["state"]
-        result = entry["result"]
+    if entry is None:
+        # Not in memory: the server may have restarted, so look on disk.
+        entry = read_job(job_id)
+    if entry is None:
+        return text_result(f"unknown job: {job_id or '(no job_id)'}", True)
+    state = entry.get("state")
+    result = entry.get("result")
     if state == "running":
-        return text_result(json.dumps({"job_id": job_id, "state": "running"}, ensure_ascii=False))
+        return text_result(
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "state": "running",
+                    "since": entry.get("created"),
+                    "note": (
+                        "if this server restarted, the turn from the previous process cannot be "
+                        "collected; check the session with antigravity_sessions"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
     return result if isinstance(result, dict) else text_result(str(result))
 
 
