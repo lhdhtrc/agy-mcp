@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.1，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.1.2，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 
 - 单文件、纯 Python 标准库、零第三方依赖
 - 凭据始终由 `agy` 自己保管（macOS 钥匙串 / Windows 凭据管理器），MCP 侧不接触 token
@@ -157,7 +157,7 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 | `antigravity_ask` | 提问 / 下达任务；默认续接同一会话，回答返回纯文本 |
 | `antigravity_quota` | 查看剩余额度（按模型组的周 / 5 小时窗口）；由 CLI 自身回答，**不扣额度** |
 | `antigravity_sessions` | 查看 / 遗忘本服务器跟踪的会话，并列出 CLI 本地已有的会话 |
-| `antigravity_models` | 列出当前账号可用的模型（含可传给 `--model` 的 id） |
+| `antigravity_models` | 列出可用模型，返回结构化 JSON（`id` + `label`，id 可直接用于 `model` 参数） |
 | `antigravity_agents` | 列出可用 agent |
 | `antigravity_status` | 诊断：agy 路径、版本、工作目录、代理可见性、当日调用与 token、耗时 p50/p95、登录探测 |
 
@@ -177,8 +177,10 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 长会话既费额度也费时间。
 
 **取消**：客户端中断一次调用（Codex 里按 Esc）会发 `notifications/cancelled`，服务器收到就立刻结束那一轮所对应的
-`agy` 会话进程，不再继续烧额度，也不再回一条没人要的响应；下次调用会自动接着同一会话继续。
+`agy` 进程（常驻会话进程，或 oneshot / 额度 / 模型这类一次性调用的进程），不再继续烧额度，
+也不再回一条没人要的响应；下次调用会自动接着同一会话继续。
 工具调用在服务器内保持先进先出，所以不会出现两轮抢同一个会话。
+只是查询用的只读工具（`status` / `models` / `agents` / `quota` / `sessions`）不排队，不会被长轮次堵住。
 
 **进度**：客户端请求里带 `progressToken` 时，服务器会把每一步转成 `notifications/progress` 发出去——
 包括步骤类型与状态，以及**正在生成的那段文字**（例如 `step 2: agent_response ACTIVE — 1 2 3 4 5`），
@@ -224,6 +226,7 @@ Claude and GPT models    Five Hour Limit Remaining     100%
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `prompt` | 必填 | 提示词 |
+| `files` | 无 | 让 Antigravity 自己去读的文件路径列表（比把文件内容粘进 prompt 更省 token） |
 | `session` | `default` | 会话名，同名 + 同 workspace 续接 |
 | `new_session` | `false` | 重开会话 |
 | `handoff` | `false` | 压成交接摘要后**开新会话**继续 |
@@ -233,18 +236,30 @@ Claude and GPT models    Five Hour Limit Remaining     100%
 | `model` / `agent` / `effort` | 无 | 透传 `--model` / `--agent` / `--effort` |
 | `mode` | 无 | `plan` 或 `accept-edits` |
 | `sandbox` | `true` | `--sandbox`，开启终端限制 |
-| `skip_permissions` | `false` | 自动批准 Antigravity 的工具调用（**谨慎**） |
+| `skip_permissions` | `true` | 自动批准工具调用（headless 无法弹审批框，关掉就连文件都读不到） |
 | `output_format` | `text` | `text`（返回解析后的回答）或 `json`（返回 CLI 原始 JSON） |
 | `json_schema` | 无 | 透传 `--json-schema`（内联 schema 或文件路径），让回答结构化 |
 | `timeout_sec` | `300` | 单次调用超时（另加 30 秒宽限） |
 | `extra_args` | 无 | 追加任意 `agy` 原始参数 |
 
-## 安全默认值
+## 默认权限：自动批准 + 终端沙箱
 
-- 默认 `--sandbox` 且不自动批准工具：Antigravity 的工具调用不会被静默放开。
-- 需要它读写某个目录时显式传 `cwd`，再按需打开 `mode=accept-edits` 或 `skip_permissions=true`，把范围限制在目标目录。
-- 服务器只在 stdio 上跑 MCP 协议，日志走 stderr，不写任何凭据文件。
-- 工具被沙箱拒绝时（CLI 仍返回 `status=SUCCESS` 但回答为空）会被识别成明确错误，而不是空回答。
+headless 模式**无法弹出批准提示**，所以"不自动批准"等于"什么都做不了"——实测默认拒绝时 Antigravity 连读一个文件都会被拒
+（`ViewFile` denied，返回空回答）。因此本服务器的默认是：
+
+```
+--sandbox --dangerously-skip-permissions
+```
+
+即**保留终端沙箱（命令仍受限制），但不再逐次请求批准**。这也是官方 CLI 在无人值守场景下的既定用法；
+代价是 agent 可以在可访问范围内读写文件、执行沙箱允许的命令，所以：
+
+- 需要严格限制时显式传 `skip_permissions: false`（配合 `cwd` 指向只读目录），但要接受"可能读不到文件"。
+- 想把影响面收窄，用 `cwd` 把它圈在目标目录，而不是关掉批准。
+- 想只读：`mode: "plan"` 会限制它不要动代码（注意 headless 下仍需上面的权限设置才读得到文件）。
+
+其余安全边界：服务器只在 stdio 上跑 MCP 协议，日志走 stderr，不写任何凭据文件；
+工具被拒时（CLI 仍返回 `status=SUCCESS` 但回答为空）会被识别成明确错误并列出 `denied_actions`，而不是空回答。
 
 ## 关于"反代 / 转 API"的取舍
 
@@ -286,6 +301,9 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | `AGY_MCP_AUTO_HANDOFF` | `0` | 设 `1` 时，上下文超过阈值的那次调用会**自动**压缩并换新会话 |
 | `AGY_MCP_USAGE_ROTATE_MB` | `5` | 用量日志超过该大小就丢掉较旧的一半（`0` = 不轮转） |
 | `AGY_MCP_PROGRESS_INTERVAL_MS` | `400` | 进度通知最小间隔（`0` = 不节流） |
+| `AGY_MCP_MAX_PROMPT_CHARS` | `100000` | prompt 软上限；超了会提示改用 `files` 或让 agent 自己读 |
+| `AGY_MCP_MAX_PARALLEL` | `1` | `>1` 时锁按会话粒度，允许多个不同会话并行（值为并发上限） |
+| `AGY_MCP_PREWARM` | `0` | 设 `1` 时服务器启动即拉起默认会话进程，第一次提问不必等冷启动 |
 | `AGY_MCP_STATE_DIR` | `~/.agy-mcp` | 会话 / 用量 / 锁文件目录 |
 | `AGY_CLI_HOME` | `~/.gemini/antigravity-cli` | CLI 自身状态目录（一般不用改） |
 
@@ -345,12 +363,13 @@ HTTPS_PROXY = "http://127.0.0.1:7890"
 
 ```bash
 python3 -m py_compile agy_mcp.py register_agy_mcp.py
-python3 test_agy_mcp.py     # 14 项离线测试：不需要网络、账号或 agy
+python3 test_agy_mcp.py     # 20 项离线测试：不需要网络、账号或 agy
 ```
 
 测试通过 `AGY_MCP_AGY_CMD` 注入一个假 CLI，因此连"常驻会话进程 + 多轮协议"也能离线跑。
 覆盖：答案提取、会话表按实例隔离、常驻进程多轮复用、oneshot 传输、handoff 换会话、**取消（Esc）**、
-进度通知（含文字片段）、自动 handoff、`--self-test`。
+进度通知（含文字片段）、自动 handoff、`--self-test`、默认权限、`files`、prompt 护栏、结构化 models、
+会话 token 累计、只读工具不排队。
 CI（GitHub Actions）在 Linux / macOS / Windows 上跑同样的命令。
 
 ## 许可

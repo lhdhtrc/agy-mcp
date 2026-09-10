@@ -62,7 +62,8 @@ if "stream-json" in argv and "--input-format" in argv:
         content = str((message.get("message") or {}).get("content", ""))
         turns += 1
         if content.startswith("slow:"):
-            time.sleep(60)  # stands in for a long agent turn; a cancel must kill it
+            # stands in for a long agent turn; a cancel must kill it
+            time.sleep(float(os.environ.get("FAKE_AGY_SLOW_SEC", "60")))
         emit({"event": "step_update", "step_update": {
             "step_index": turns, "state": "ACTIVE", "step_type": "agent_response",
             "text_delta": "partial answer " + str(turns),
@@ -154,9 +155,13 @@ def read_store(state_dir: str) -> dict:
         return json.load(handle)
 
 
-def tracked_conversation_ids(response: dict) -> set:
-    report = json.loads(response["result"]["content"][0]["text"])
-    return {entry["conversation_id"] for entry in report["tracked_sessions"]}
+def stored_conversation_ids(state_dir: str) -> set:
+    store = read_store(state_dir)
+    return {
+        entry["conversation_id"]
+        for instance in store["instances"].values()
+        for entry in instance["sessions"].values()
+    }
 
 
 def test_extract_answer() -> None:
@@ -294,21 +299,24 @@ def test_oneshot_transport_still_answers() -> None:
 
 def test_handoff_starts_a_new_conversation_with_the_digest() -> None:
     with tempfile.TemporaryDirectory(prefix="agy-mcp-handoff-") as state:
-        responses = run_server(
-            [
-                ask(1, "remember VIOLET-7391", session="handoff-check"),
-                call(2, "antigravity_sessions"),
-                ask(3, "what was the token?", session="handoff-check", handoff=True),
-                call(4, "antigravity_sessions"),
-            ],
-            {"AGY_MCP_STATE_DIR": state, "AGY_MCP_TRANSPORT": "stream"},
-        )
-        before = tracked_conversation_ids(responses[2])
-        after = tracked_conversation_ids(responses[4])
-        assert len(before) == 1 and len(after) == 1
-        assert before != after, f"handoff must land in a new conversation: {before} -> {after}"
+        # Two separate client calls: the previous conversation must be adopted by the
+        # second run (AGY_MCP_INSTANCE_WINDOW_SEC=0 forces that in the test).
+        env = {
+            "AGY_MCP_STATE_DIR": state,
+            "AGY_MCP_TRANSPORT": "stream",
+            "AGY_MCP_INSTANCE_WINDOW_SEC": "0",
+        }
+        run_server([ask(1, "remember VIOLET-7391", session="handoff-check")], env)
+        before = stored_conversation_ids(state)
+        assert len(before) == 1, before
 
-        answer = responses[3]["result"]["content"][0]["text"]
+        responses = run_server(
+            [ask(1, "what was the token?", session="handoff-check", handoff=True)], env
+        )
+        after = stored_conversation_ids(state)
+        assert after - before, f"handoff must land in a new conversation: {before} -> {after}"
+
+        answer = responses[1]["result"]["content"][0]["text"]
         # The digest turn runs on the old conversation, then the prompt is seeded into a new one.
         assert "echo: Summarize the conversation above" in answer, answer
         assert answer.endswith("what was the token?"), answer
@@ -426,27 +434,108 @@ def test_self_test_reports_ready() -> None:
 
 def test_auto_handoff_compacts_a_long_conversation() -> None:
     with tempfile.TemporaryDirectory(prefix="agy-mcp-auto-") as state:
-        responses = run_server(
-            [
-                ask(1, "remember VIOLET-7391", session="auto-check"),
-                call(2, "antigravity_sessions"),
-                ask(3, "status?", session="auto-check"),
-                call(4, "antigravity_sessions"),
-            ],
-            {
-                "AGY_MCP_STATE_DIR": state,
-                # The fake reports 10 input tokens for the first turn, so a 5-token
-                # ceiling makes the follow-up call compact automatically.
-                "AGY_MCP_AUTO_HANDOFF": "1",
-                "AGY_MCP_LONG_CONTEXT_TOKENS": "5",
-            },
-        )
-        before = tracked_conversation_ids(responses[2])
-        after = tracked_conversation_ids(responses[4])
-        assert before != after, f"auto-handoff must start a new conversation: {before} -> {after}"
-        answer = responses[3]["result"]["content"][0]["text"]
+        env = {
+            "AGY_MCP_STATE_DIR": state,
+            # The fake reports 10 input tokens for the first turn, so a 5-token
+            # ceiling makes the follow-up call compact automatically.
+            "AGY_MCP_AUTO_HANDOFF": "1",
+            "AGY_MCP_LONG_CONTEXT_TOKENS": "5",
+            "AGY_MCP_INSTANCE_WINDOW_SEC": "0",
+        }
+        run_server([ask(1, "remember VIOLET-7391", session="auto-check")], env)
+        before = stored_conversation_ids(state)
+
+        responses = run_server([ask(1, "status?", session="auto-check")], env)
+        after = stored_conversation_ids(state)
+        assert after - before, f"auto-handoff must start a new conversation: {before} -> {after}"
+        answer = responses[1]["result"]["content"][0]["text"]
         assert "echo: Summarize the conversation above" in answer, answer
-        assert any("auto-handoff" in note["text"] for note in responses[3]["result"]["content"][1:])
+        assert any("auto-handoff" in note["text"] for note in responses[1]["result"]["content"][1:])
+
+
+def test_defaults_auto_approve_and_keep_the_sandbox() -> None:
+    flags = agy_mcp.session_flags({}, None, False)
+    assert "--dangerously-skip-permissions" in flags
+    assert "--sandbox" in flags
+    assert "--dangerously-skip-permissions" not in agy_mcp.session_flags(
+        {"skip_permissions": False}, None, False
+    )
+
+
+def test_files_parameter_is_prepended_to_the_prompt() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-files-") as state:
+        responses = run_server(
+            [ask(1, "review it", session="files-check", files=["/tmp/a.py", "/tmp/b.py"])],
+            {"AGY_MCP_STATE_DIR": state},
+        )
+        text = responses[1]["result"]["content"][0]["text"]
+        assert "/tmp/a.py" in text and "/tmp/b.py" in text, text
+        assert text.endswith("review it"), text
+
+
+def test_prompt_size_guard() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-guard-") as state:
+        responses = run_server(
+            [ask(1, "x" * 500, session="guard-check")],
+            {"AGY_MCP_STATE_DIR": state, "AGY_MCP_MAX_PROMPT_CHARS": "100"},
+        )
+        result = responses[1]["result"]
+        assert result["isError"] is True
+        assert "AGY_MCP_MAX_PROMPT_CHARS" in result["content"][0]["text"]
+
+
+def test_models_are_returned_structured() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-models-") as state:
+        responses = run_server([call(1, "antigravity_models")], {"AGY_MCP_STATE_DIR": state})
+        payload = json.loads(responses[1]["result"]["content"][0]["text"])
+        assert payload["models"][0] == {"id": "fake-model-a", "label": "Fake A"}, payload
+
+
+def test_sessions_record_token_totals() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-tokens-") as state:
+        run_server([ask(1, "hello", session="token-check")], {"AGY_MCP_STATE_DIR": state})
+        store = read_store(state)
+        entry = [e for inst in store["instances"].values() for e in inst["sessions"].values()][0]
+        assert entry["input_tokens"] == 10 and entry["output_tokens"] == 1, entry
+
+
+def test_read_only_tools_do_not_queue_behind_a_turn() -> None:
+    """`models` must answer while a long turn is still running, not after it."""
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-fast-") as state:
+        env = {
+            **os.environ,
+            "AGY_MCP_STATE_DIR": state,
+            "AGY_MCP_MIN_INTERVAL_SEC": "0",
+            "AGY_MCP_TRANSPORT": "stream",
+            "AGY_MCP_AGY_CMD": f'"{sys.executable}" "{_fake_cli()}"',
+            "FAKE_AGY_SLOW_SEC": "4",
+        }
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(HERE, "agy_mcp.py")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", cwd=HERE, env=env, bufsize=1,
+        )
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(ask(1, "slow: take your time", session="fast-check")) + "\n")
+            proc.stdin.flush()
+            time.sleep(1.0)
+            proc.stdin.write(json.dumps(call(2, "antigravity_models")) + "\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+            out, _ = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+        order = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                payload = json.loads(line)
+                if "id" in payload:
+                    order.append(payload["id"])
+        assert order[:2] == [2, 1], f"models should answer before the slow turn finishes: {order}"
 
 
 TESTS = (
@@ -464,6 +553,12 @@ TESTS = (
     test_progress_notifications_are_emitted,
     test_auto_handoff_compacts_a_long_conversation,
     test_self_test_reports_ready,
+    test_defaults_auto_approve_and_keep_the_sandbox,
+    test_files_parameter_is_prepended_to_the_prompt,
+    test_prompt_size_guard,
+    test_models_are_returned_structured,
+    test_sessions_record_token_totals,
+    test_read_only_tools_do_not_queue_behind_a_turn,
 )
 
 

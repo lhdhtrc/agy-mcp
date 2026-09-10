@@ -13,6 +13,8 @@ The CLI keeps its own Google sign-in state; this server never touches credential
 from __future__ import annotations
 
 import atexit
+import contextlib
+import hashlib
 import json
 import os
 import queue
@@ -26,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.1"
+SERVER_VERSION = "0.1.2"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -63,6 +65,7 @@ DEFAULT_LONG_CONTEXT_TOKENS = 100000
 DEFAULT_SHUTDOWN_GRACE_SEC = 10.0
 DEFAULT_USAGE_ROTATE_MB = 5.0
 DEFAULT_PROGRESS_INTERVAL_MS = 400
+DEFAULT_MAX_PROMPT_CHARS = 100000
 HANDOFF_PROMPT = (
     "Summarize the conversation above into a handoff brief that a brand-new session can pick up from.\n"
     "Requirements:\n"
@@ -420,6 +423,21 @@ def seed_prompt(prompt: str, digest: Optional[str]) -> str:
     )
 
 
+def attach_files(prompt: str, files: Any) -> str:
+    """Prepend file paths the agent should read itself (cheaper than pasting contents)."""
+    if not isinstance(files, list):
+        return prompt
+    paths = [str(item).strip() for item in files if str(item).strip()]
+    if not paths:
+        return prompt
+    listing = "\n".join(f"- {path}" for path in paths)
+    return (
+        "Read these files yourself with your file tools before answering:\n"
+        f"{listing}\n\n"
+        f"Then complete this task:\n\n{prompt}"
+    )
+
+
 def mask_proxy(value: str) -> str:
     """Hide credentials in a proxy URL before showing it back to the model."""
     if "@" in value:
@@ -501,6 +519,10 @@ def run_agy(
         errors="replace",
         **popen_kwargs,
     )
+    # Expose the process to a running tool call so a client cancellation can kill it.
+    task = current_task()
+    if task is not None:
+        task.process = proc
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -510,6 +532,9 @@ def run_agy(
         except subprocess.TimeoutExpired:
             out, err = "", ""
         raise
+    finally:
+        if task is not None:
+            task.process = None
     return proc.returncode, out or "", err or ""
 
 
@@ -709,6 +734,9 @@ SHUTDOWN_GRACE_SEC = _env_float("AGY_MCP_SHUTDOWN_GRACE_SEC", DEFAULT_SHUTDOWN_G
 AUTO_HANDOFF = _env_int("AGY_MCP_AUTO_HANDOFF", 0) != 0
 USAGE_ROTATE_BYTES = int(_env_float("AGY_MCP_USAGE_ROTATE_MB", DEFAULT_USAGE_ROTATE_MB) * 1024 * 1024)
 PROGRESS_INTERVAL_MS = _env_int("AGY_MCP_PROGRESS_INTERVAL_MS", DEFAULT_PROGRESS_INTERVAL_MS)
+MAX_PROMPT_CHARS = _env_int("AGY_MCP_MAX_PROMPT_CHARS", DEFAULT_MAX_PROMPT_CHARS)
+MAX_PARALLEL = max(1, _env_int("AGY_MCP_MAX_PARALLEL", 1))
+PREWARM = _env_int("AGY_MCP_PREWARM", 0) != 0
 
 
 def reap_workers() -> None:
@@ -764,6 +792,7 @@ class ActiveTask:
         self.cancelled = threading.Event()
         self.suppress_response = False
         self.worker: Optional["Worker"] = None
+        self.process: Optional[subprocess.Popen] = None
 
     def bind(self, worker: Optional["Worker"]) -> None:
         self.worker = worker
@@ -808,6 +837,8 @@ def cancel_task(request_id: Any) -> bool:
     log(f"cancel {request_id!r}: stopping the Antigravity turn")
     if task.worker is not None:
         task.worker.stop()
+    if task.process is not None:
+        kill_process_tree(task.process)
     return True
 
 
@@ -873,7 +904,7 @@ def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_re
         flags.append("-c")
     if args.get("sandbox", True):
         flags.append("--sandbox")
-    if args.get("skip_permissions", False):
+    if args.get("skip_permissions", True):
         flags.append("--dangerously-skip-permissions")
     if args.get("disable_slash_commands", True):
         flags.append("--disable-slash-commands")
@@ -883,12 +914,80 @@ def session_flags(args: Dict[str, Any], conversation: Optional[str], continue_re
     return flags
 
 
+PARALLEL_SLOTS = threading.BoundedSemaphore(MAX_PARALLEL) if MAX_PARALLEL > 1 else None
+FAST_TOOLS = frozenset(
+    {
+        "antigravity_status",
+        "antigravity_models",
+        "antigravity_agents",
+        "antigravity_quota",
+        "antigravity_sessions",
+    }
+)
+
+
+def session_lock_path(session_name: str, workspace: str) -> str:
+    digest = hashlib.sha1(f"{session_name}|{workspace}".encode("utf-8")).hexdigest()[:16]
+    return os.path.join(STATE_DIR, f"call-{digest}.lock")
+
+
+@contextlib.contextmanager
+def turn_guard(session_name: str, workspace: str) -> Any:
+    """Serialize Antigravity turns.
+
+    Default: one turn at a time across every process (extra safety for the account).
+    With AGY_MCP_MAX_PARALLEL > 1 the lock becomes per session, so two different
+    conversations may run side by side, bounded by that many slots.
+    """
+    if PARALLEL_SLOTS is None:
+        with FileLock(LOCK_PATH, LOCK_WAIT_SEC):
+            yield
+        return
+    if not PARALLEL_SLOTS.acquire(timeout=LOCK_WAIT_SEC):
+        raise TimeoutError("no free Antigravity slot")
+    try:
+        with FileLock(session_lock_path(session_name, workspace), LOCK_WAIT_SEC):
+            yield
+    finally:
+        PARALLEL_SLOTS.release()
+
+
+def prewarm_default_session() -> None:
+    """Start the default session process early so the first real call is already warm."""
+    try:
+        workspace = os.path.abspath(os.getcwd())
+        base_flags = session_flags(
+            {"sandbox": True, "skip_permissions": True, "disable_slash_commands": True}, None, False
+        )
+        key = f"{DEFAULT_SESSION}|{workspace}|{' '.join(base_flags)}"
+        if key in WORKERS:
+            return
+        worker = Worker(
+            key,
+            ["--input-format", "stream-json", "--output-format", "stream-json"] + base_flags,
+            workspace,
+        )
+        worker.start()
+        WORKERS[key] = worker
+        log(f"prewarmed the default session process for {workspace}")
+    except Exception as exc:  # noqa: BLE001 - prewarming is best effort
+        log(f"prewarm failed: {exc!r}")
+
+
 ASK_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "prompt": {
             "type": "string",
             "description": "Prompt sent to the Antigravity CLI in non-interactive print mode.",
+        },
+        "files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Paths the Antigravity agent should read itself before answering, instead of "
+                "pasting file contents into the prompt."
+            ),
         },
         "model": {"type": "string", "description": "Optional Antigravity model id."},
         "effort": {
@@ -934,8 +1033,12 @@ ASK_SCHEMA: Dict[str, Any] = {
         },
         "skip_permissions": {
             "type": "boolean",
-            "default": False,
-            "description": "Auto-approve Antigravity tool permission prompts (default false).",
+            "default": True,
+            "description": (
+                "Auto-approve Antigravity tool permissions (default true). Headless runs cannot "
+                "prompt for approval, so without this the agent cannot even read a file; the "
+                "terminal sandbox stays on unless you disable it."
+            ),
         },
         "continue_session": {
             "type": "boolean",
@@ -1047,6 +1150,13 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
         return text_result("antigravity_ask requires a non-empty 'prompt' string.", True)
     if is_cancelled():
         return text_result("Antigravity turn cancelled before it started.", True)
+    if MAX_PROMPT_CHARS and len(prompt) > MAX_PROMPT_CHARS:
+        return text_result(
+            f"prompt is {len(prompt)} characters, over AGY_MCP_MAX_PROMPT_CHARS={MAX_PROMPT_CHARS}; "
+            "pass file paths in `files` (or set cwd and let the agent read them) instead of pasting contents",
+            True,
+        )
+    prompt = attach_files(prompt, args.get("files"))
 
     workspace = os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd())
     if not os.path.isdir(workspace):
@@ -1110,7 +1220,7 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
 
     notify_progress(0, "queued for Antigravity", force=True)
     try:
-        with FileLock(LOCK_PATH, LOCK_WAIT_SEC):
+        with turn_guard(session_name, workspace):
             state = read_state()
             used = calls_today(state)
             if MAX_CALLS_PER_DAY and used >= MAX_CALLS_PER_DAY:
@@ -1287,6 +1397,9 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     "num_turns": payload.get("num_turns") if payload else None,
                     "last_model": args.get("model") or (payload.get("model") if payload else None),
                     "last_input_tokens": current_input,
+                    "input_tokens": int(entry.get("input_tokens", 0) or 0) + current_input,
+                    "output_tokens": int(entry.get("output_tokens", 0) or 0)
+                    + int(usage_tokens.get("output_tokens", 0) or 0),
                 }
                 write_sessions(sessions)
 
@@ -1394,6 +1507,33 @@ def tool_simple(argv: List[str], label: str) -> Dict[str, Any]:
     except FileNotFoundError as exc:
         return text_result(str(exc), True)
     return text_result(join_streams(code, out, err), code != 0)
+
+
+def parse_models(text: str) -> List[Dict[str, str]]:
+    """`agy models` prints one `id<TAB>label` record per line."""
+    models: List[Dict[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        identifier, _, label = line.partition("\t")
+        if identifier.strip():
+            models.append({"id": identifier.strip(), "label": label.strip()})
+    return models
+
+
+def tool_models(args: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        code, models_text = cached_models()
+    except subprocess.TimeoutExpired:
+        return text_result("agy models timed out.", True)
+    except FileNotFoundError as exc:
+        return text_result(str(exc), True)
+    models = parse_models(models_text)
+    payload: Dict[str, Any] = {"count": len(models), "models": models}
+    if not models:
+        payload["raw"] = models_text.strip()
+    return text_result(json.dumps(payload, ensure_ascii=False, indent=2), code != 0 and not models)
 
 
 QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
@@ -1553,6 +1693,9 @@ def tool_sessions(args: Dict[str, Any]) -> Dict[str, Any]:
                 "workspace": entry.get("workspace"),
                 "calls": entry.get("calls"),
                 "num_turns": entry.get("num_turns"),
+                "input_tokens": entry.get("input_tokens"),
+                "output_tokens": entry.get("output_tokens"),
+                "last_error": entry.get("last_error"),
                 "updated": entry.get("updated"),
             }
         )
@@ -1589,7 +1732,7 @@ def tool_sessions(args: Dict[str, Any]) -> Dict[str, Any]:
 
 HANDLERS = {
     "antigravity_ask": tool_ask,
-    "antigravity_models": lambda args: tool_simple(["models"], "models"),
+    "antigravity_models": tool_models,
     "antigravity_agents": lambda args: tool_simple(["agent"], "agent"),
     "antigravity_sessions": tool_sessions,
     "antigravity_quota": tool_quota,
@@ -1703,6 +1846,8 @@ def serve() -> int:
     _install_signal_handlers()
     threading.Thread(target=_reaper_loop, daemon=True).start()
     threading.Thread(target=_tool_call_loop, daemon=True).start()
+    if PREWARM:
+        threading.Thread(target=prewarm_default_session, daemon=True).start()
     while True:
         raw = sys.stdin.buffer.readline()
         if not raw:
@@ -1725,7 +1870,12 @@ def serve() -> int:
             meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
             task = ActiveTask(message["id"], meta.get("progressToken"))
             register_task(task)
-            TOOL_QUEUE.put((message, task))
+            if str(params.get("name") or "") in FAST_TOOLS:
+                # Read-only helpers do not touch a session process: never queue them
+                # behind a long Antigravity turn.
+                threading.Thread(target=_run_tool_call, args=(message, task), daemon=True).start()
+            else:
+                TOOL_QUEUE.put((message, task))
             continue
 
         try:
