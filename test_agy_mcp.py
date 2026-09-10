@@ -24,13 +24,13 @@ sys.path.insert(0, HERE)
 
 import agy_mcp  # noqa: E402  (import after the state dir is set)
 
-# A stand-in for the Antigravity CLI: speaks print mode (`-p ... --output-format json`) and
-# the stream transport used by the resident session process. Lets the whole turn protocol be
-# tested offline, with no network, no account and no `agy` installed.
+# Antigravity CLI 的替身：既能说 print 模式（`-p ... --output-format json`），
+# 也能说常驻会话进程用的 stream 传输。这样整套轮次协议都能离线测试，
+# 不需要网络、账号，也不需要真的装 agy。
 FAKE_AGY = r'''
 import json, sys, time, uuid
 
-# The server speaks UTF-8 on the pipes; do not let the fixture's locale decode it differently.
+# 服务器在管道上用 UTF-8；别让替身进程按本地编码去解。
 sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -62,7 +62,7 @@ if "stream-json" in argv and "--input-format" in argv:
         content = str((message.get("message") or {}).get("content", ""))
         turns += 1
         if content.startswith("slow:"):
-            # stands in for a long agent turn; a cancel must kill it
+            # 代表一个很长的 agent 轮次；取消必须能把它杀掉
             time.sleep(float(os.environ.get("FAKE_AGY_SLOW_SEC", "60")))
         emit({"event": "step_update", "step_update": {
             "step_index": turns, "state": "ACTIVE", "step_type": "agent_response",
@@ -174,7 +174,7 @@ def latest_session_entry(state_dir: str) -> dict:
 
 def test_extract_answer() -> None:
     assert agy_mcp.extract_answer({"response": "PONG\n", "conversation_id": "x"}) == "PONG"
-    # A sandbox-denied turn is SUCCESS with an empty response: never fall back to metadata.
+    # 被沙箱拒绝的轮次会返回 SUCCESS + 空回答：绝不能退回去取元数据当答案。
     denied = {
         "conversation_id": "982a645c-81fe-4a2a-b72c-470709b6a6fa",
         "status": "SUCCESS",
@@ -209,7 +209,7 @@ def test_sessions_are_scoped_per_instance() -> None:
     store = json.load(open(agy_mcp.SESSIONS_PATH, encoding="utf-8"))
     assert "instances" in store, "store must be namespaced by server instance"
 
-    # A second instance (another client thread) must not inherit while the first looks alive.
+    # 第二个实例（另一个客户端会话）在第一个仍活跃时不得继承它的会话。
     real_id = agy_mcp.INSTANCE_ID
     try:
         agy_mcp.INSTANCE_ID = "other-instance-1"
@@ -217,7 +217,7 @@ def test_sessions_are_scoped_per_instance() -> None:
     finally:
         agy_mcp.INSTANCE_ID = real_id
 
-    # A stale instance is adopted, so a restarted server keeps its conversation.
+    # 陈旧实例会被接管，所以重启后的服务器仍能接着原来的会话。
     store["instances"][real_id]["last_seen"] = 0
     with open(agy_mcp.SESSIONS_PATH, "w", encoding="utf-8") as handle:
         json.dump(store, handle)
@@ -309,8 +309,8 @@ def test_oneshot_transport_still_answers() -> None:
 
 def test_handoff_starts_a_new_conversation_with_the_digest() -> None:
     with tempfile.TemporaryDirectory(prefix="agy-mcp-handoff-") as state:
-        # Two separate client calls: the previous conversation must be adopted by the
-        # second run (AGY_MCP_INSTANCE_WINDOW_SEC=0 forces that in the test).
+        # 两次独立的客户端调用：第二次必须接管上一次的会话
+        # （测试里用 AGY_MCP_INSTANCE_WINDOW_SEC=0 强制接管）。
         env = {
             "AGY_MCP_STATE_DIR": state,
             "AGY_MCP_TRANSPORT": "stream",
@@ -327,7 +327,7 @@ def test_handoff_starts_a_new_conversation_with_the_digest() -> None:
         assert after - before, f"handoff must land in a new conversation: {before} -> {after}"
 
         answer = responses[1]["result"]["content"][0]["text"]
-        # The digest turn runs on the old conversation, then the prompt is seeded into a new one.
+        # 摘要轮跑在旧会话上，随后把摘要作为前情提要喂给新会话。
         assert "echo: Summarize the conversation above" in answer, answer
         assert answer.endswith("what was the token?"), answer
 
@@ -410,7 +410,7 @@ def test_progress_notifications_are_emitted() -> None:
         assert all(u["params"]["progressToken"] == "tok-42" for u in updates)
         assert any("queued" in str(u["params"]["message"]) for u in updates)
         assert any(u["params"]["progress"] >= 1 for u in updates), updates
-        # The streamed text delta is forwarded so a client can show the answer growing.
+        # 流式文字片段会被转发出去，客户端据此显示回答在逐步生成。
         assert any("agent_response" in str(u["params"]["message"]) for u in updates), updates
         assert any("partial answer" in str(u["params"]["message"]) for u in updates), updates
 
@@ -446,8 +446,8 @@ def test_auto_handoff_compacts_a_long_conversation() -> None:
     with tempfile.TemporaryDirectory(prefix="agy-mcp-auto-") as state:
         env = {
             "AGY_MCP_STATE_DIR": state,
-            # The fake reports 10 input tokens for the first turn, so a 5-token
-            # ceiling makes the follow-up call compact automatically.
+            # 替身第一轮上报 10 个 input token，所以把阈值设成 5 就能让
+            # 下一次调用自动压缩。
             "AGY_MCP_AUTO_HANDOFF": "1",
             "AGY_MCP_LONG_CONTEXT_TOKENS": "5",
             "AGY_MCP_INSTANCE_WINDOW_SEC": "0",
@@ -619,40 +619,40 @@ def test_effort_is_reconciled_with_the_model_id() -> None:
     assert (model, effort) == ("gemini-3.8-flash-low", "low"), (model, effort)
     assert any("gemini-3.8-flash-low" in note for note in notes), notes
 
-    # already consistent: pass both through untouched
+    # 本来就一致：模型与强度都原样透传
     assert agy_mcp.reconcile_model_and_effort("gemini-3.8-flash-low", "low", True)[:2] == (
         "gemini-3.8-flash-low",
         "low",
     )
 
-    # a family without an effort suffix keeps the model and drops the effort
+    # 没有强度后缀的模型系列：保留模型、放弃 effort
     model, effort, notes = agy_mcp.reconcile_model_and_effort("claude-sonnet-4-6", "low", True)
     assert (model, effort) == ("claude-sonnet-4-6", None)
     assert any("ignored" in note for note in notes), notes
 
-    # no model at all: the effort alone is fine
+    # 完全没有模型：只传 effort 也可以
     assert agy_mcp.reconcile_model_and_effort(None, "low", False) == (None, "low", [])
 
 
 def test_effort_change_is_sticky_for_the_session() -> None:
     with tempfile.TemporaryDirectory(prefix="agy-mcp-effort-") as state:
-        # A real client keeps one server process; the window forces the same model here.
+        # 真实客户端只保留一个服务器进程；这里用窗口设置强制走同一模型。
         env = {"AGY_MCP_STATE_DIR": state, "AGY_MCP_INSTANCE_WINDOW_SEC": "0"}
         first = run_server([ask(1, "hello", session="effort-check", effort="low")], env)
         notes = [item["text"] for item in first[1]["result"]["content"][1:]]
         assert any("gemini-3.8-flash-low" in note for note in notes), notes
 
-        # no effort argument this time: the session keeps the value set above
+        # 这次不传 effort：会话沿用它上面设过的值
         second = run_server([ask(1, "again", session="effort-check")], env)
         entry = latest_session_entry(state)
         assert entry["effort"] == "low", entry
         assert entry["model"] == "gemini-3.8-flash-low", entry
         assert second[1]["result"]["isError"] is False
 
-        # "default" clears it again
+        # "default" 重新把它清掉
         run_server([ask(1, "clear it", session="effort-check", effort="default", model="default")], env)
         entry = latest_session_entry(state)
-        # effort is gone; the model falls back to the configured default
+        # effort 已清除；模型回落到配置的默认值
         assert entry["effort"] is None, entry
         assert entry["model"] == agy_mcp.DEFAULT_MODEL_ID, entry
 
@@ -681,7 +681,7 @@ def test_stream_fixture_still_parses() -> None:
     assert result["status"] == "SUCCESS"
     assert agy_mcp.extract_answer(result) == "OK"
 
-    # the same helpers the live worker uses must derive progress from the fixture
+    # 常驻进程用的同一套辅助函数，必须能从这份 fixture 里推导出进度
     active = next(event for event in events if event.get("step_update", {}).get("state") == "ACTIVE")
     label, detail = agy_mcp.progress_from_event(active)
     assert "agent_response" in label, label
@@ -720,7 +720,7 @@ def test_quota_warning_is_warn_only_and_cooldown_limited() -> None:
         agy_mcp.QUOTA_CACHE.update({"ts": time.time(), "payload": _quota_payload(4, 90)})
         warning = agy_mcp.quota_warning()
         assert warning and "Gemini Models" in warning, warning
-        # cooldown: the same state must not nag on every call
+        # 冷却：同样的状态不能每次调用都唠叨一遍
         assert agy_mcp.quota_warning() is None
     finally:
         agy_mcp.QUOTA_CACHE.update(original)

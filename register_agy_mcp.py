@@ -178,7 +178,7 @@ def codex_tool_entries(codex_config: str) -> dict:
     servers = data.get("mcp_servers")
     if not isinstance(servers, dict):
         return {}
-    # Skip our own server: sharing it would let agy call agy-mcp and recurse.
+    # 跳过我们自己的服务器：把它共享出去，agy 就能再调用 agy-mcp，形成递归。
     return {
         name: entry
         for name, entry in servers.items()
