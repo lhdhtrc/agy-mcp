@@ -164,6 +164,14 @@ def stored_conversation_ids(state_dir: str) -> set:
     }
 
 
+def latest_session_entry(state_dir: str) -> dict:
+    """The session record of the instance that wrote most recently."""
+    store = read_store(state_dir)
+    instances = [data for data in store["instances"].values() if data.get("sessions")]
+    newest = max(instances, key=lambda data: float(data.get("last_seen") or 0))
+    return next(iter(newest["sessions"].values()))
+
+
 def test_extract_answer() -> None:
     assert agy_mcp.extract_answer({"response": "PONG\n", "conversation_id": "x"}) == "PONG"
     # A sandbox-denied turn is SUCCESS with an empty response: never fall back to metadata.
@@ -603,6 +611,50 @@ def _quota_payload(gemini_percent: float, third_party_percent: float) -> dict:
     }
 
 
+def test_effort_is_reconciled_with_the_model_id() -> None:
+    """The CLI rejects `--model gemini-3.8-flash-high --effort low`, so keep them consistent."""
+    model, effort, notes = agy_mcp.reconcile_model_and_effort("gemini-3.8-flash-high", "low", False)
+    assert (model, effort) == ("gemini-3.8-flash-low", "low"), (model, effort)
+    assert any("gemini-3.8-flash-low" in note for note in notes), notes
+
+    # already consistent: pass both through untouched
+    assert agy_mcp.reconcile_model_and_effort("gemini-3.8-flash-low", "low", True)[:2] == (
+        "gemini-3.8-flash-low",
+        "low",
+    )
+
+    # a family without an effort suffix keeps the model and drops the effort
+    model, effort, notes = agy_mcp.reconcile_model_and_effort("claude-sonnet-4-6", "low", True)
+    assert (model, effort) == ("claude-sonnet-4-6", None)
+    assert any("ignored" in note for note in notes), notes
+
+    # no model at all: the effort alone is fine
+    assert agy_mcp.reconcile_model_and_effort(None, "low", False) == (None, "low", [])
+
+
+def test_effort_change_is_sticky_for_the_session() -> None:
+    with tempfile.TemporaryDirectory(prefix="agy-mcp-effort-") as state:
+        # A real client keeps one server process; the window forces the same model here.
+        env = {"AGY_MCP_STATE_DIR": state, "AGY_MCP_INSTANCE_WINDOW_SEC": "0"}
+        first = run_server([ask(1, "hello", session="effort-check", effort="low")], env)
+        notes = [item["text"] for item in first[1]["result"]["content"][1:]]
+        assert any("gemini-3.8-flash-low" in note for note in notes), notes
+
+        # no effort argument this time: the session keeps the value set above
+        second = run_server([ask(1, "again", session="effort-check")], env)
+        entry = latest_session_entry(state)
+        assert entry["effort"] == "low", entry
+        assert entry["model"] == "gemini-3.8-flash-low", entry
+        assert second[1]["result"]["isError"] is False
+
+        # "default" clears it again
+        run_server([ask(1, "clear it", session="effort-check", effort="default", model="default")], env)
+        entry = latest_session_entry(state)
+        # effort is gone; the model falls back to the configured default
+        assert entry["effort"] is None, entry
+        assert entry["model"] == agy_mcp.DEFAULT_MODEL_ID, entry
+
+
 def test_stream_fixture_still_parses() -> None:
     """Regression guard against CLI protocol drift: a recorded real stream must stay parsable."""
     fixture = os.path.join(HERE, "tests", "fixtures", "stream_turn.ndjson")
@@ -750,6 +802,8 @@ TESTS = (
     test_diff_on_a_non_repo_is_reported_not_fatal,
     test_model_defaults_and_auto_selection,
     test_stream_fixture_still_parses,
+    test_effort_is_reconciled_with_the_model_id,
+    test_effort_change_is_sticky_for_the_session,
     test_quota_warning_is_warn_only_and_cooldown_limited,
     test_orphan_reaping_never_kills_unrelated_processes,
     test_read_only_tools_do_not_queue_behind_a_turn,

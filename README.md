@@ -4,7 +4,7 @@
 让 Codex、Claude 等 MCP 客户端可以直接调用它——用你已有的 Antigravity 账号额度（含 Google One AI Pro）
 回答、读仓库、跑 agent，而**不必把 Google 凭据导出给任何中转**。
 
-> 当前版本 v0.1.5，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
+> 当前版本 v0.1.6，见 [Releases](https://github.com/lhdhtrc/agy-mcp/releases)。
 >
 > 兼容性：目前只在 **Windows** 实机验证过（agy 1.2.0）。macOS / Linux 的代码路径已按平台写好、
 > 离线测试覆盖，但还没有实机跑过 `--self-test`；跑通后欢迎反馈。
@@ -191,6 +191,9 @@ NO_PROXY = 'localhost,127.0.0.1,::1'
 工具调用在服务器内保持先进先出，所以不会出现两轮抢同一个会话。
 只是查询用的只读工具（`status` / `models` / `agents` / `quota` / `sessions`）不排队，不会被长轮次堵住。
 
+**改模型/强度不会打断正在跑的工作**：切换只在轮次之间生效——正在执行的 Antigravity 轮次会跑完，
+旧进程被标记为待回收，空闲后立刻停掉，新轮次用新配置继续同一个会话（上下文不丢）。
+
 **进度**：客户端请求里带 `progressToken` 时，服务器会把每一步转成 `notifications/progress` 发出去——
 包括步骤类型与状态，以及**正在生成的那段文字**（例如 `step 2: agent_response ACTIVE — 1 2 3 4 5`），
 长时间任务不会再看起来像卡死。默认节流到每 400ms 一条，可用 `AGY_MCP_PROGRESS_INTERVAL_MS` 调整。
@@ -257,7 +260,8 @@ Claude and GPT models    Five Hour Limit Remaining     100%
 | `continue_session` | `false` | 让 CLI 自己挑最近一个会话续接 |
 | `cwd` | 当前工作目录 | 作为 Antigravity 会话的 workspace |
 | `model` | `gemini-3.8-flash-high` | 模型 id（见 `antigravity_models`），或 `auto`：按剩余额度自动挑一组还有余量的模型 |
-| `agent` / `effort` | 无 | 透传 `--agent` / `--effort` |
+| `agent` | 无 | 透传 `--agent` |
+| `effort` | 会话记忆 | `low` / `medium` / `high`；**改一次就一直生效**，`"default"` 清除。模型 id 自带强度，传 effort 会自动换成同族的对应档（如 `gemini-3.8-flash-high` → `flash-low`），不会报冲突 |
 | `mode` | 无 | `plan` 或 `accept-edits` |
 | `sandbox` | `true` | `--sandbox`，开启终端限制 |
 | `skip_permissions` | `true` | 自动批准工具调用（headless 无法弹审批框，关掉就连文件都读不到） |
@@ -354,6 +358,7 @@ MCP 路线对前两条是结构性免疫：请求由官方 CLI 自己发出，OA
 | 评审改动 | `diff: true` + `prompt="逐条评审这些改动，按 file:line 给结论，指出风险与遗漏"` |
 | 只出方案不改代码 | `mode: "plan"` + 说明"只给方案，不要改文件" |
 | 省钱跑日常 | 不传 `model`（默认 `gemini-3.8-flash-high`），或用 `effort: "low"` 压思考预算 |
+| 中途改强度 | 直接传一次 `effort: "low"`（或 `medium` / `high`）——从**下一轮**开始生效并一直保留；`effort: "default"` 恢复 CLI 默认 |
 | 难题上强模型 | `model: "claude-opus-4-6-thinking"`（或 `gemini-3.1-pro-high`） |
 | 不知道额度够不够 | `model: "auto"`：按 `antigravity_quota` 的组余量挑一个还有空间的模型，并在回答里说明选了什么 |
 | 让它读指定文件 | `files: ["/abs/a.py", "/abs/b.md"]`，比把内容粘进 prompt 省 token |

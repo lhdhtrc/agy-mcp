@@ -28,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SERVER_NAME = "antigravity"
-SERVER_VERSION = "0.1.5"
+SERVER_VERSION = "0.1.6"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -660,6 +660,7 @@ class Worker:
         self.last_used = time.time()
         self.turns = 0
         self.busy = False
+        self.retire = False
 
     def start(self) -> None:
         command = agy_command_prefix()
@@ -822,6 +823,11 @@ def reap_workers() -> None:
         worker = WORKERS[key]
         if worker.busy:
             continue  # a long turn must not be reaped from under itself
+        if worker.retire:
+            # Retired because the session switched model/effort: stop it between turns only.
+            worker.stop()
+            WORKERS.pop(key, None)
+            continue
         idle = WORKER_IDLE_SEC > 0 and now - worker.last_used > WORKER_IDLE_SEC
         if not worker.alive() or idle:
             worker.stop()
@@ -1352,7 +1358,6 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
             True,
         )
     prompt = attach_files(prompt, args.get("files"))
-    args["model"], model_notes = resolve_model(args.get("model"))
 
     workspace = os.path.abspath(str(args.get("cwd"))) if args.get("cwd") else os.path.abspath(os.getcwd())
     if not os.path.isdir(workspace):
@@ -1369,7 +1374,6 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
     entry = entry if isinstance(entry, dict) else {}
     notes: List[str] = []
     resumed = False
-    notes.extend(model_notes)
     warning = quota_warning()
     if warning:
         notes.append(warning)
@@ -1404,6 +1408,42 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 f"auto-handoff: the previous turn resent about {previous_input} input tokens; "
                 "compacting into a fresh conversation (AGY_MCP_AUTO_HANDOFF=1)"
             )
+
+    # Model and reasoning effort are sticky per session: a mid-conversation change keeps
+    # applying until the caller passes "default" (or names another model/effort).
+    def _clears(value: Any) -> bool:
+        return str(value or "").strip().lower() in ("", "default")
+
+    sticky_model = entry.get("model")
+    sticky_effort = entry.get("effort")
+    model_arg, effort_arg = args.get("model"), args.get("effort")
+    model_explicit = not _clears(model_arg)
+    effort_explicit = not _clears(effort_arg)
+
+    wanted_model = (
+        model_arg
+        if model_explicit
+        else (None if str(model_arg or "").strip().lower() == "default" else sticky_model)
+    )
+    wanted_effort = (
+        str(effort_arg).strip().lower()
+        if effort_explicit
+        else (None if str(effort_arg or "").strip().lower() == "default" else sticky_effort)
+    )
+
+    resolved_model, model_notes = resolve_model(wanted_model)
+    resolved_model, resolved_effort, effort_notes = reconcile_model_and_effort(
+        resolved_model, wanted_effort, bool(model_explicit or sticky_model)
+    )
+    notes.extend(model_notes + effort_notes)
+    if effort_explicit and resolved_effort != (sticky_effort or None):
+        notes.append(f"reasoning effort for session '{session_name}' is now {resolved_effort or 'the CLI default'}")
+    if model_explicit and resolved_model != (sticky_model or None):
+        notes.append(f"model for session '{session_name}' is now {resolved_model}")
+    args["model"] = resolved_model or ""
+    args["effort"] = resolved_effort or ""
+    session_model = resolved_model or None
+    session_effort = resolved_effort or None
 
     flags = session_flags(args, conversation, continue_recent)
     requested_format = str(args.get("output_format") or "text")
@@ -1454,7 +1494,17 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                 base_flags = session_flags(args, None, continue_recent)
                 key = f"{session_name}|{workspace}|{' '.join(base_flags)}"
                 for stale in [k for k in WORKERS if k.startswith(f"{session_name}|{workspace}|") and k != key]:
-                    WORKERS.pop(stale).stop()
+                    # A model/effort switch must never cut into work that is already running:
+                    # retire the old process and let it stop at the next turn boundary.
+                    stale_worker = WORKERS[stale]
+                    if stale_worker.busy:
+                        stale_worker.retire = True
+                        notes.append(
+                            "model/effort change takes effect from the next turn; "
+                            "the running Antigravity turn is left to finish"
+                        )
+                    else:
+                        WORKERS.pop(stale).stop()
                 worker = WORKERS.get(key)
                 if worker is not None and not worker.alive():
                     worker.stop()
@@ -1604,6 +1654,8 @@ def tool_ask(args: Dict[str, Any]) -> Dict[str, Any]:
                     "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "calls": int(entry.get("calls", 0) or 0) + 1 if previous == captured else 1,
                     "num_turns": payload.get("num_turns") if payload else None,
+                    "model": session_model,
+                    "effort": session_effort,
                     "last_model": args.get("model") or (payload.get("model") if payload else None),
                     "last_input_tokens": current_input,
                     "input_tokens": int(entry.get("input_tokens", 0) or 0) + current_input,
@@ -1891,6 +1943,47 @@ def model_group(model_id: str) -> str:
     return "Gemini Models"
 
 
+EFFORT_LEVELS = ("low", "medium", "high")
+
+
+def model_for_effort(model_id: str, effort: str) -> Optional[str]:
+    """Model ids embed the reasoning effort (`...-high`); return the same family at `effort`."""
+    for suffix in EFFORT_LEVELS:
+        if model_id.endswith("-" + suffix):
+            return model_id[: -len(suffix)] + effort
+    return None
+
+
+def reconcile_model_and_effort(
+    model_id: Optional[str], effort: Optional[str], model_was_explicit: bool
+) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """The CLI rejects `--model <x>-high` together with `--effort low`, so keep them consistent.
+
+    Returns (model, effort, notes). Model ids that embed an effort get rewritten to the
+    requested level; ids without one keep the model and drop the effort with a note.
+    """
+    if not effort:
+        return model_id, None, []
+    effort = str(effort).strip().lower()
+    if effort not in EFFORT_LEVELS:
+        return model_id, None, [f"ignored unknown effort {effort!r} (expected low|medium|high)"]
+    if not model_id:
+        return None, effort, []
+
+    mapped = model_for_effort(model_id, effort)
+    if mapped is None:
+        return model_id, None, [
+            f"{model_id} does not encode a reasoning effort, so effort={effort} was ignored"
+        ]
+    if mapped == model_id:
+        return model_id, effort, []
+    notes = [
+        f"effort={effort}: using {mapped} instead of {model_id}"
+        + ("" if model_was_explicit else " (default model)")
+    ]
+    return mapped, effort, notes
+
+
 def resolve_model(requested: Any) -> Tuple[Optional[str], List[str]]:
     """Resolve the `model` argument: a concrete id, `auto` (quota aware), or the default."""
     requested_text = str(requested).strip() if requested else ""
@@ -2001,6 +2094,8 @@ def tool_sessions(args: Dict[str, Any]) -> Dict[str, Any]:
                 "workspace": entry.get("workspace"),
                 "calls": entry.get("calls"),
                 "num_turns": entry.get("num_turns"),
+                "model": entry.get("model"),
+                "effort": entry.get("effort"),
                 "input_tokens": entry.get("input_tokens"),
                 "output_tokens": entry.get("output_tokens"),
                 "last_error": entry.get("last_error"),
